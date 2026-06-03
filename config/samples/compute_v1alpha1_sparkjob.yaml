@@ -1,0 +1,19 @@
+apiVersion: compute.compute.example.com/v1alpha1
+kind: SparkJob
+metadata:
+  name: sparkjob-sample
+spec:
+  image: busybox:1.36
+  type: Scala
+  mainApplicationFile: local:///opt/app/job.jar
+  arguments: ["--input", "s3://demo/in", "--output", "s3://demo/out"]
+  minExecutors: 1
+  maxExecutors: 4
+  resourceHint:
+    inputSizeMB: 512
+    costPerHourUSD: "0.08"
+  spot:
+    enabled: false
+    maxRetries: 2
+  checkpoint:
+    enabled: false

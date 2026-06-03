@@ -1,0 +1,5 @@
+## Append samples of your project ##
+resources:
+- compute_v1alpha1_sparkjob.yaml
+- compute_v1alpha1_trainingrun.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples

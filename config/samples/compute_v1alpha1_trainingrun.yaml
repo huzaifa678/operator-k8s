@@ -1,0 +1,15 @@
+apiVersion: compute.compute.example.com/v1alpha1
+kind: TrainingRun
+metadata:
+  name: trainingrun-sample
+spec:
+  framework: PyTorch
+  image: busybox:1.36
+  worldSize: 2
+  resourceHint:
+    costPerHourUSD: "0.50"
+  spot:
+    enabled: false
+    maxRetries: 2
+  checkpoint:
+    enabled: false
