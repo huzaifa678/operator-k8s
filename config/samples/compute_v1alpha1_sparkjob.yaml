@@ -1,17 +1,28 @@
 apiVersion: compute.compute.example.com/v1alpha1
 kind: SparkJob
 metadata:
-  name: sparkjob-sample
+  name: sparkpi-sample
 spec:
-  image: busybox:1.36
+  image: apache/spark:3.5.3
   type: Scala
-  mainApplicationFile: local:///opt/app/job.jar
-  arguments: ["--input", "s3://demo/in", "--output", "s3://demo/out"]
+  mainClass: org.apache.spark.examples.SparkPi
+  mainApplicationFile: local:///opt/spark/examples/jars/spark-examples_2.12-3.5.3.jar
+  arguments: ["100"]
   minExecutors: 1
   maxExecutors: 4
   resourceHint:
     inputSizeMB: 512
     costPerHourUSD: "0.08"
+  driverResources:
+    requests:
+      cpu: "250m"
+      memory: "512Mi"
+  executorResources:
+    requests:
+      cpu: "250m"
+      memory: "512Mi"
+  sparkConf:
+    spark.kubernetes.executor.deleteOnTermination: "false"
   spot:
     enabled: false
     maxRetries: 2

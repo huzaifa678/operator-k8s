@@ -204,11 +204,18 @@ spec:
                 format: int32
                 type: integer
               image:
-                description: Container image bundling the Spark distribution + the
-                  application JAR/py.
+                default: apache/spark:3.5.3
+                description: |-
+                  Container image with a Spark distribution. Must contain /opt/spark/bin/spark-submit.
+                  Defaults to apache/spark:3.5.3.
                 type: string
               mainApplicationFile:
-                description: Main class (Scala/Java) or main file path (Python/R).
+                description: |-
+                  JAR or .py file the driver runs. May be local:///path baked into the image,
+                  or a fetchable http(s):// / s3a:// URI.
+                type: string
+              mainClass:
+                description: Fully-qualified main class (Scala/Java only).
                 type: string
               maxExecutors:
                 default: 20
@@ -234,6 +241,16 @@ spec:
                       count.
                     format: int64
                     type: integer
+                type: object
+              serviceAccount:
+                description: |-
+                  ServiceAccount the driver runs as. If empty, the controller creates
+                  `<job>-driver-sa` with the minimum RBAC Spark needs to create executor pods.
+                type: string
+              sparkConf:
+                additionalProperties:
+                  type: string
+                description: Extra --conf key=value pairs passed to spark-submit.
                 type: object
               spot:
                 description: SpotPolicy controls how the controller schedules onto
@@ -267,7 +284,6 @@ spec:
                 - R
                 type: string
             required:
-            - image
             - mainApplicationFile
             type: object
           status:

@@ -17,9 +17,11 @@ import (
 
 // SparkJobSpec defines a Spark application to submit and supervise.
 type SparkJobSpec struct {
-	// Container image bundling the Spark distribution + the application JAR/py.
-	// +kubebuilder:validation:Required
-	Image string `json:"image"`
+	// Container image with a Spark distribution. Must contain /opt/spark/bin/spark-submit.
+	// Defaults to apache/spark:3.5.3.
+	// +optional
+	// +kubebuilder:default="apache/spark:3.5.3"
+	Image string `json:"image,omitempty"`
 
 	// Application type. Affects how the driver command is constructed.
 	// +kubebuilder:validation:Enum=Scala;Python;R
@@ -27,9 +29,23 @@ type SparkJobSpec struct {
 	// +optional
 	Type string `json:"type,omitempty"`
 
-	// Main class (Scala/Java) or main file path (Python/R).
+	// JAR or .py file the driver runs. May be local:///path baked into the image,
+	// or a fetchable http(s):// / s3a:// URI.
 	// +kubebuilder:validation:Required
 	MainApplicationFile string `json:"mainApplicationFile"`
+
+	// Fully-qualified main class (Scala/Java only).
+	// +optional
+	MainClass string `json:"mainClass,omitempty"`
+
+	// Extra --conf key=value pairs passed to spark-submit.
+	// +optional
+	SparkConf map[string]string `json:"sparkConf,omitempty"`
+
+	// ServiceAccount the driver runs as. If empty, the controller creates
+	// `<job>-driver-sa` with the minimum RBAC Spark needs to create executor pods.
+	// +optional
+	ServiceAccount string `json:"serviceAccount,omitempty"`
 
 	// Arguments passed to the application.
 	// +optional

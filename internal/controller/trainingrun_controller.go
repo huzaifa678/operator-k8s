@@ -160,36 +160,36 @@ func (r *TrainingRunReconciler) updateTrainingStatus(ctx context.Context, run *c
 	run.Status.ReadyWorkers = ready
 
 	switch {
-		case succeeded == run.Spec.WorldSize && run.Spec.WorldSize > 0:
-			run.Status.Phase = computev1alpha1.PhaseSucceeded
+	case succeeded == run.Spec.WorldSize && run.Spec.WorldSize > 0:
+		run.Status.Phase = computev1alpha1.PhaseSucceeded
+		if run.Status.CompletionTime == nil {
+			now := metav1.Now()
+			run.Status.CompletionTime = &now
+		}
+	case failed > 0:
+		if run.Status.Resumes < run.Spec.Spot.MaxRetries {
+			run.Status.Resumes++
+			for _, p := range workers {
+				if p.Status.Phase == corev1.PodFailed {
+					_ = r.Delete(ctx, p)
+				}
+			}
+			run.Status.Phase = computev1alpha1.PhaseResuming
+		} else {
+			run.Status.Phase = computev1alpha1.PhaseFailed
 			if run.Status.CompletionTime == nil {
 				now := metav1.Now()
 				run.Status.CompletionTime = &now
 			}
-		case failed > 0:
-			if run.Status.Resumes < run.Spec.Spot.MaxRetries {
-				run.Status.Resumes++
-				for _, p := range workers {
-					if p.Status.Phase == corev1.PodFailed {
-						_ = r.Delete(ctx, p)
-					}
-				}
-				run.Status.Phase = computev1alpha1.PhaseResuming
-			} else {
-				run.Status.Phase = computev1alpha1.PhaseFailed
-				if run.Status.CompletionTime == nil {
-					now := metav1.Now()
-					run.Status.CompletionTime = &now
-				}
-			}
-		case ready == run.Spec.WorldSize && run.Spec.WorldSize > 0:
-			run.Status.Phase = computev1alpha1.PhaseRunning
-			if run.Status.StartTime == nil {
-				now := metav1.Now()
-				run.Status.StartTime = &now
-			}
-		default:
-			run.Status.Phase = computev1alpha1.PhasePending
+		}
+	case ready == run.Spec.WorldSize && run.Spec.WorldSize > 0:
+		run.Status.Phase = computev1alpha1.PhaseRunning
+		if run.Status.StartTime == nil {
+			now := metav1.Now()
+			run.Status.StartTime = &now
+		}
+	default:
+		run.Status.Phase = computev1alpha1.PhasePending
 	}
 
 	run.Status.EstimatedCostUSD = estimateCost(run.Status.StartTime, run.Status.CompletionTime,
