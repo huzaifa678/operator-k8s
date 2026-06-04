@@ -3,7 +3,7 @@ IMG ?= controller:latest
 # YEAR defines the year value used for substituting the YEAR placeholder in the boilerplate header.
 YEAR ?= $(shell date +%Y)
 
-# Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
+# Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)ff
 ifeq (,$(shell go env GOBIN))
 GOBIN=$(shell go env GOPATH)/bin
 else
