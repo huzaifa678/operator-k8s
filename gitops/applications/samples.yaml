@@ -1,0 +1,36 @@
+# samples Application — the example SparkJob / TrainingRun CRs.
+#
+# Auto-sync is INTENTIONALLY OFF here. Sample CRs spawn real workloads (driver
+# pods, executor pods, training workers) — you almost never want them
+# auto-recreated whenever you reach `make manifests`. Sync manually:
+#
+#   argocd app sync samples
+#
+# Or from a local working tree without a git push:
+#
+#   argocd app sync samples --local ./config/samples
+#
+# Or apply only a specific resource:
+#
+#   argocd app sync samples --resource '*:SparkJob:sparkpi-sample'
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: samples
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/huzaifa678/compute-operator.git
+    targetRevision: HEAD
+    path: config/samples
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: default
+  # No syncPolicy.automated block → manual sync only.
+  syncPolicy:
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true

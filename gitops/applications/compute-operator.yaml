@@ -1,0 +1,48 @@
+# compute-operator Application — the controller, CRDs, RBAC, and webhook config.
+#
+# Auto-sync ON because this is infra: any merged change to config/default should
+# land in the cluster within a minute.
+#
+# Local-sync override (no git push needed):
+#   argocd app sync compute-operator --local ./config/default
+#
+# Image bump override (no git push needed):
+#   argocd app set compute-operator -p image.tag=v0.2.0
+#   argocd app sync compute-operator
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: compute-operator
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io   # cascade-delete on `argocd app delete`
+spec:
+  project: default
+  source:
+    # CHANGE THESE TWO LINES to your fork.
+    repoURL: https://github.com/huzaifa678/compute-operator.git
+    targetRevision: HEAD
+    path: config/default
+    kustomize:
+      # Override the controller image without editing config/manager/kustomization.yaml.
+      # Bump with: argocd app set compute-operator --kustomize-image controller=<repo>:<tag>
+      images:
+        - controller=ghcr.io/huzaifa678/compute-operator:latest
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: compute-operator-system
+  syncPolicy:
+    automated:
+      prune: true       # remove resources that were deleted from git
+      selfHeal: true    # revert manual `kubectl edit` drifts
+      allowEmpty: false
+    syncOptions:
+      - CreateNamespace=true
+      - ServerSideApply=true     # CRDs are big; SSA avoids "last-applied-configuration too long"
+      - PrunePropagationPolicy=foreground
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m

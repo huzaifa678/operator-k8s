@@ -113,7 +113,15 @@ build: manifests generate fmt vet ## Build manager binary.
 	go build -o bin/manager cmd/main.go
 
 .PHONY: run
-run: manifests generate fmt vet ## Run a controller from your host.
+run: manifests generate fmt vet ## Run a controller from your host (webhooks OFF — no TLS certs locally).
+	ENABLE_WEBHOOKS=false go run ./cmd/main.go
+
+.PHONY: gen-webhook-certs
+gen-webhook-certs: ## Generate a self-signed cert at $TMPDIR/k8s-webhook-server/serving-certs/ for local webhook dev.
+	./scripts/gen-webhook-certs.sh
+
+.PHONY: run-with-webhooks
+run-with-webhooks: manifests generate fmt vet gen-webhook-certs ## Run with webhooks ON. Auto-generates self-signed certs first.
 	go run ./cmd/main.go
 
 # If you wish to build the manager image targeting other platforms you can use the --platform flag.
@@ -174,6 +182,48 @@ deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in
 .PHONY: undeploy
 undeploy: kustomize ## Undeploy controller from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
 	"$(KUSTOMIZE)" build config/default | "$(KUBECTL)" delete --ignore-not-found=$(ignore-not-found) -f -
+
+##@ GitOps (ArgoCD)
+
+ARGOCD_NAMESPACE ?= argocd
+
+.PHONY: install-argocd
+install-argocd: ## Install ArgoCD into the cluster and print the admin password + port-forward command.
+	./gitops/install-argocd.sh
+
+.PHONY: gitops-bootstrap
+gitops-bootstrap: ## Apply the root Application manifests (controller auto-syncs, samples are manual).
+	kubectl apply -n $(ARGOCD_NAMESPACE) -f gitops/applications/compute-operator.yaml
+	kubectl apply -n $(ARGOCD_NAMESPACE) -f gitops/applications/samples.yaml
+	@echo
+	@echo "Applications registered. Sync with:"
+	@echo "  argocd app sync compute-operator    # the controller"
+	@echo "  argocd app sync samples             # the example CRs (manual on purpose)"
+
+.PHONY: gitops-bootstrap-appset
+gitops-bootstrap-appset: ## Also install the per-sample ApplicationSet (one App per sample file).
+	kubectl apply -n $(ARGOCD_NAMESPACE) -f gitops/applicationset-per-sample.yaml
+
+.PHONY: gitops-sync
+gitops-sync: ## Trigger a sync of every compute-operator-owned Application.
+	argocd app sync compute-operator
+	argocd app sync samples
+	@for app in $$(argocd app list -o name | grep '^sample-' || true); do \
+	  argocd app sync "$$app"; \
+	done
+
+.PHONY: gitops-sync-local
+gitops-sync-local: ## Sync the controller from the local working tree (no git push required).
+	argocd app sync compute-operator --local ./config/default
+
+.PHONY: gitops-sync-samples
+gitops-sync-samples: ## Sync only the sample CRs (manual trigger; matches the no-auto-sync policy).
+	argocd app sync samples
+
+.PHONY: gitops-status
+gitops-status: ## Print sync + health status for every compute-operator Application.
+	argocd app list | head -1
+	argocd app list | grep -E 'compute-operator|samples|^sample-' || true
 
 ##@ GPU stack
 

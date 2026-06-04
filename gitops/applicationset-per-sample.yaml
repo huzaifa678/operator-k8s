@@ -1,0 +1,47 @@
+# ApplicationSet — generates one Application per file under config/samples/.
+#
+# Why bother when `samples.yaml` already deploys them all together?
+# Per-sample Applications let you sync / prune / refresh individually:
+#
+#   argocd app sync sample-compute_v1alpha1_sparkjob
+#   argocd app sync sample-compute_v1alpha1_trainingrun_gpu
+#
+# That makes the dev loop much friendlier: iterating on the GPU sample
+# without re-creating the CPU one.
+#
+# This is also the "drop a new file -> get an Application for free" loop:
+# add config/samples/foo.yaml and the next ApplicationSet generator pass
+# materializes a `sample-foo` Application — no Application YAML to author.
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: samples-per-file
+  namespace: argocd
+spec:
+  generators:
+    - git:
+        repoURL: https://github.com/huzaifa678/compute-operator.git
+        revision: HEAD
+        files:
+          - path: "config/samples/compute_v1alpha1_*.yaml"
+  template:
+    metadata:
+      # path.basenameNormalized = "compute_v1alpha1_sparkjob"
+      name: 'sample-{{ path.basenameNormalized }}'
+    spec:
+      project: default
+      source:
+        repoURL: https://github.com/huzaifa678/compute-operator.git
+        targetRevision: HEAD
+        # Use a directory pointer with `include` so we only ship the one file.
+        path: config/samples
+        directory:
+          include: '{{ path.filename }}'
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: default
+      # Per-sample manual sync only.
+      syncPolicy:
+        syncOptions:
+          - CreateNamespace=true
+          - ServerSideApply=true

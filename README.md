@@ -162,7 +162,8 @@ flowchart TD
 |------|--------------|
 | `api/v1alpha1/` | Go types — source of truth for both CRDs |
 | `internal/controller/` | Reconcilers + unit/integration tests (envtest) |
-| `cmd/main.go` | Manager entrypoint (registers both controllers) |
+| `internal/webhook/v1alpha1/` | Validating admission webhooks + their tests |
+| `cmd/main.go` | Manager entrypoint (registers both controllers + webhooks) |
 | `config/` | Kustomize manifests (CRDs, RBAC, Deployment, samples) |
 | `config/samples/` | Working `SparkJob` and `TrainingRun` CRs |
 | `dist/chart/` | Generated Helm chart (mirror of `config/`) |
@@ -463,7 +464,19 @@ make run
 kubectl apply -f config/samples/compute_v1alpha1_sparkjob.yaml
 ```
 
-This loop is exactly what **ArgoCD** (see roadmap) automates away — point ArgoCD at the `config/samples/` directory in your git repo and it `kubectl apply`s on every push.
+**ArgoCD eliminates most of this loop** — see [`gitops/README.md`](gitops/README.md) for the full setup. TL;DR:
+
+```bash
+make install-argocd          # one-time
+make gitops-bootstrap        # registers compute-operator + samples Applications
+
+# Now changes flow three ways without manually rerunning kubectl apply:
+#   1. Git auto-sync (push to main; controller picks it up in ~60s)
+#   2. Local sync   — argocd app sync compute-operator --local ./config/default
+#   3. Param set    — argocd app set compute-operator --kustomize-image controller=…
+```
+
+Crucially the `samples` Application has auto-sync **OFF** so applying `compute_v1alpha1_sparkjob.yaml` is still a deliberate `argocd app sync samples` (or `make gitops-sync-samples`) — sample CRs spawn real driver/executor pods, you don't want them re-created on every commit.
 
 ---
 
@@ -504,10 +517,102 @@ helm upgrade --install compute-op ./dist/chart \
 
 ---
 
+## CR validation (admission webhook)
+
+Both CRDs have a **validating admission webhook** (`internal/webhook/v1alpha1/`) that runs on every `CREATE` and `UPDATE` and rejects semantically invalid CRs before they reach the controller. This catches things kubebuilder's OpenAPI markers can't express.
+
+### What the SparkJob webhook enforces
+
+- `mainApplicationFile` is non-empty
+- `executors`, `minExecutors`, `maxExecutors` are non-negative; `min <= max` when both set
+- Warns when `executors` is set AND auto-tune bounds are set (auto-tune is silently disabled)
+- Warns when `type=Scala` and `mainClass` is empty (works for fat-JARs only)
+- Warns when `type=Python` and `mainClass` is set (ignored)
+- `checkpoint.s3URI` is required when `checkpoint.enabled=true`; must start with `s3://` or `s3a://`
+- `resourceHint.costPerHourUSD` parses as a non-negative float
+- `executorResources.requests.cpu` is > 0 (the millicores → cores rounding would fail at 0)
+- `spot.maxRetries >= 0`
+- Warns on `sparkConf` keys that don't start with `spark.`
+
+### What the TrainingRun webhook enforces
+
+- `image` non-empty, `worldSize >= 1`
+- `datasetPVC` and `datasetS3URI` are mutually exclusive; `datasetS3URI` must start with `s3://` or `s3a://`
+- Warns when `script` is set AND `command` is overridden (your custom command bypasses the default torchrun + /scripts/train.py)
+- Warns when `packages` is set AND `command` is overridden (`pip install` only happens in the default command)
+- `gpu.perWorker >= 1` when `gpu.enabled=true`
+- Warns on `gpu.enabled=true, backend=gloo` (wastes the interconnect) and `gpu.enabled=false, backend=nccl` (NCCL needs CUDA, will crash at `init_process_group`)
+- `checkpoint.s3URI` rules same as SparkJob
+- `resourceHint.costPerHourUSD` parses
+
+### Enabling / disabling
+
+| Mode | When | How |
+|------|------|-----|
+| **OFF** (default for `make run`) | Local dev — no TLS certs to manage | `ENABLE_WEBHOOKS=false go run ./cmd/main.go` |
+| **ON** (default in cluster) | `make deploy IMG=…` ships the cert-manager-issued certs alongside the controller | Webhook server boots automatically |
+| **ON locally** | You want to test rejection paths against your dev cluster | `make run-with-webhooks` — requires certs under `/tmp/k8s-webhook-server/serving-certs/` or `--webhook-cert-path=<dir>` |
+
+The webhook is also covered by **15 unit tests** in `internal/webhook/v1alpha1/*_test.go` (91.6% coverage), so the rules are pinned independently of whether the live server is running.
+
+### Try it
+
+```bash
+# With webhooks running (in-cluster):
+kubectl apply -f - <<EOF
+apiVersion: compute.compute.example.com/v1alpha1
+kind: TrainingRun
+metadata: { name: bad }
+spec:
+  image: ""              # rejected: image required
+  worldSize: 0           # rejected: worldSize must be >= 1
+  gpu: { enabled: true, perWorker: 0 }   # rejected: perWorker must be >= 1
+EOF
+# Error from server (Invalid): TrainingRun.compute.compute.example.com "bad" is invalid:
+#   [spec.image: Required value, spec.worldSize: Invalid value: 0: must be >= 1,
+#    spec.gpu.perWorker: Invalid value: 0: must be >= 1 when spec.gpu.enabled=true]
+```
+
+---
+
+## Known issues & rough edges
+
+This is a working operator, not a hardened one. The list below is honest — fix priorities ranked by **confidence that it will bite you** in real use. "High" means I've seen or can reproduce the failure; "Medium" means the path exists and is plausible; "Low" means theoretical.
+
+### High — fix before production
+
+| Issue | Where | Why it bites |
+|-------|-------|--------------|
+| **`humanMem()` only handles whole-Gi or whole-Mi values cleanly.** `1500Mi` → `"1500m"` is fine, but `1.5Gi` → `"1536m"` looks weird in Spark logs; `512Mi` → `"512m"` is correct | `internal/controller/sparkjob_controller.go::humanMem` | Memory tuning will surprise people. Should output `g`/`m` based on the original unit, not byte arithmetic. |
+| **Spark image pre-pull is mandatory on slow links.** `apache/spark:3.5.3` is ~600 MB; if the controller creates the driver pod before kubelet finishes pulling, ImagePullBackOff is the default state for ~2 min | The image is set in `sparkjob_types.go` default; no pre-flight check | Document only fix today — `docker pull && k3d image import` in README. A real fix would add a pre-flight Job that pre-pulls on each node. |
+
+### Medium — known but workable
+
+| Issue | Where | Why it bites |
+|-------|-------|--------------|
+| **ConfigMap updates don't restart worker pods.** Editing `spec.script` updates the ConfigMap, kubelet syncs the new file into the pod's mounted volume eventually, but `torchrun` already loaded the old script | `trainingrun_controller.go::ensureScriptConfigMap` | Iterating on the script is "delete the run, reapply" — same loop as iterating on Go code. Fix would be a script hash annotation on the pod template that forces a restart. |
+| **Status uses `Update` not `Patch`.** We tolerate `IsConflict`, but if two writers (controller + a future webhook) race, fields can be lost between reads | both `updateStatus` functions | Today only the reconciler writes status, so the race window is theoretical. Becomes real the moment we add a finalizer or a metrics-collecting sidecar. |
+| **Cost accrual doesn't reset on retry.** `estimatedCostUSD` is computed from `startTime` to now; if a retry pushes the workload through a new driver pod, the cost shown is wall-clock since the *first* attempt — which is what the user is actually paying. Arguably correct, but easy to misread as "current pod cost" | `estimateCost()` in `sparkjob_controller.go` | Sample dashboard would need to make this distinction explicit. |
+| **Helm chart drifts from `config/`.** `dist/chart/` was generated once via `kubebuilder edit --plugins=helm/v1-alpha` and isn't regenerated by `make manifests`. Bumping a CRD field bumps `config/crd/bases/` but leaves `dist/chart/templates/crd/` stale | `Makefile` doesn't chain chart regen into `manifests` | Either accept Kustomize as the canonical path and treat chart as snapshot, or wire a `chart-sync` target into `manifests`. |
+| **`samples.yaml` applies both CPU and GPU TrainingRuns simultaneously.** On a no-GPU cluster the GPU one sits Pending forever and looks like a failure in `argocd app status` | `gitops/applications/samples.yaml` | Either split into per-environment apps, or document the `--resource` filter prominently. |
+
+### Low — theoretical or cosmetic
+
+| Issue | Where | Why it bites |
+|-------|-------|--------------|
+| **Leader election ID is hardcoded.** `ab130378.compute.example.com` is the kubebuilder-generated default | `cmd/main.go::ctrl.Options` | Two parallel installs in the same namespace would fight for the lease. Almost never relevant in practice. |
+| **No reconcile dedup metrics.** Burst reconciles (one CR change triggers ~5 events from owned resources) are wasted CPU | controllers' watch setup | Performance footnote, not correctness. |
+| **`mapPodToOwner` walks both label namespaces** | both controllers | If labels were ever swapped/typo'd, one controller could enqueue the other's CRs. Label keys are constants so this is currently impossible. |
+
+### Where to focus next
+
+Pick from "High" before claiming this is production-ready. The webhook + the `humanMem` fix are both ~half a day of work; the others compound.
+
 ## Roadmap
 
-- [ ] Graceful shutdown in `cmd/main.go` (signal handling so in-flight reconciles drain)
-- [ ] ArgoCD `Application` manifest under `gitops/` so the cluster reconciles itself
+- [x] Graceful shutdown in `cmd/main.go` — `--graceful-shutdown-timeout` flag drains in-flight reconciles before exit, releases leader lock cleanly
+- [x] ArgoCD setup — `gitops/` with `Application` + `ApplicationSet` manifests, `make install-argocd`, `make gitops-bootstrap`, local-sync escape hatches (see [`gitops/README.md`](gitops/README.md))
+- [x] Validating admission webhooks for both CRDs — 15 unit tests at 91.6% coverage
 - [ ] Real checkpoint manager (MinIO + S3-compatible) wired to `spec.checkpoint`
 - [ ] NodeTerminating-taint watcher → checkpoint before spot eviction
 - [ ] Airflow `DAGRun` CRD (third controller)

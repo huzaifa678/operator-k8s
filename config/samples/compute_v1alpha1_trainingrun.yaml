@@ -34,7 +34,41 @@ spec:
   script: |
     """Toy distributed fine-tune of bert-tiny on a hard-coded 2-class dataset.
     Demonstrates the controller's torchrun + headless-svc + ranked DNS plumbing
-    end to end on CPU. Replace with your real script in production. Tweakable or changable to your needs"""
+    end to end on CPU.
+
+    ─── TWEAK POINTS ─────────────────────────────────────────────────────────
+    Everything below is intentionally minimal. Adapt to your workload:
+
+      MODEL          Swap to any HuggingFace causal-LM, seq-classification,
+                     or seq-to-seq checkpoint. e.g. "bert-base-uncased",
+                     "distilbert-base-uncased", "google/flan-t5-small".
+                     Bigger models need more memory in workerResources.
+
+      NUM_LABELS     Match your task. 2 for binary sentiment, N for N-class.
+
+      EPOCHS / LR    Bumped down to fit the toy dataset; raise for real data.
+
+      ToyDataset     Replace SAMPLES with a torch.utils.data.Dataset that
+                     reads your real corpus (from /data if you mounted a
+                     datasetPVC, or from S3/GCS via fsspec). The DDP +
+                     DistributedSampler scaffolding stays unchanged.
+
+      Model head     AutoModelForSequenceClassification works for classification.
+                     Use AutoModelForCausalLM, AutoModelForSeq2SeqLM, etc.
+                     for other tasks — the rest of the loop is task-agnostic.
+
+      Optimizer      AdamW is the default; swap for Lion, AdaFactor, or
+                     bitsandbytes 8-bit Adam to fit larger models on the
+                     same hardware.
+
+      Checkpointing  Add torch.save(model.state_dict(), "/data/ckpt.pt")
+                     once per epoch on rank 0. The controller's
+                     spec.checkpoint.s3URI will eventually wire this up.
+
+      Logging        print() goes to kubectl logs. For W&B / MLflow, add
+                     `wandb` to spec.packages and call wandb.init() on rank 0.
+    ──────────────────────────────────────────────────────────────────────────
+    """
     import os
     import torch
     import torch.distributed as dist
@@ -43,9 +77,16 @@ spec:
     from torch.utils.data import DataLoader, Dataset, DistributedSampler
     from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
-    MODEL = "prajjwal1/bert-tiny"          # ~17 MB pretrained model
-    EPOCHS = 3
+    # ─── tweak: model + task config ───────────────────────────────────────
+    MODEL       = "prajjwal1/bert-tiny"   # ~17 MB. Try "distilbert-base-uncased" (~250 MB).
+    NUM_LABELS  = 2                       # 2-class. Change for multi-class.
+    MAX_LENGTH  = 32                      # tokenizer truncation. Raise for longer text.
+    BATCH_SIZE  = 2                       # per-rank batch. Effective = BATCH_SIZE * world_size.
+    EPOCHS      = 3
+    LEARNING_RATE = 5e-5
 
+    # ─── tweak: replace with your own Dataset ─────────────────────────────
+    # Read from /data (mount via spec.datasetPVC) or stream from S3.
     class ToyDataset(Dataset):
         SAMPLES = [
             ("the movie was wonderful and uplifting", 1),
@@ -55,7 +96,7 @@ spec:
         ]
         def __init__(self, tok):
             self.enc = [tok(s, padding="max_length", truncation=True,
-                            max_length=32, return_tensors="pt")
+                            max_length=MAX_LENGTH, return_tensors="pt")
                         for s, _ in self.SAMPLES]
             self.lab = torch.tensor([l for _, l in self.SAMPLES])
         def __len__(self):  return len(self.SAMPLES)
@@ -72,13 +113,16 @@ spec:
         print(f"[rank {rank}/{world_size}] handshake OK on backend={backend}", flush=True)
 
         tok   = AutoTokenizer.from_pretrained(MODEL)
-        model = AutoModelForSequenceClassification.from_pretrained(MODEL, num_labels=2)
+        # ─── tweak: pick the model head that matches your task ───────────
+        # AutoModelForSequenceClassification / CausalLM / Seq2SeqLM / TokenClassification …
+        model = AutoModelForSequenceClassification.from_pretrained(MODEL, num_labels=NUM_LABELS)
         model = DDP(model)
 
         ds      = ToyDataset(tok)
         sampler = DistributedSampler(ds, num_replicas=world_size, rank=rank, shuffle=True)
-        loader  = DataLoader(ds, batch_size=2, sampler=sampler)
-        optim   = AdamW(model.parameters(), lr=5e-5)
+        loader  = DataLoader(ds, batch_size=BATCH_SIZE, sampler=sampler)
+        # ─── tweak: swap optimizer if scaling to a bigger model ──────────
+        optim   = AdamW(model.parameters(), lr=LEARNING_RATE)
 
         for epoch in range(EPOCHS):
             sampler.set_epoch(epoch)

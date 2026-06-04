@@ -20,6 +20,7 @@ import (
 	"crypto/tls"
 	"flag"
 	"os"
+	"time"
 
 	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
 	// to ensure that exec-entrypoint and run can make use of them.
@@ -37,6 +38,7 @@ import (
 
 	computev1alpha1 "github.com/huzaifa678/compute-operator/api/v1alpha1"
 	"github.com/huzaifa678/compute-operator/internal/controller"
+	webhookv1alpha1 "github.com/huzaifa678/compute-operator/internal/webhook/v1alpha1"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -61,6 +63,7 @@ func main() {
 	var probeAddr string
 	var secureMetrics bool
 	var enableHTTP2 bool
+	var gracefulShutdownTimeout time.Duration
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
@@ -79,6 +82,9 @@ func main() {
 	flag.StringVar(&metricsCertKey, "metrics-cert-key", "tls.key", "The name of the metrics server key file.")
 	flag.BoolVar(&enableHTTP2, "enable-http2", false,
 		"If set, HTTP/2 will be enabled for the metrics and webhook servers")
+	flag.DurationVar(&gracefulShutdownTimeout, "graceful-shutdown-timeout", 30*time.Second,
+		"Maximum time to wait for in-flight reconciles to drain on SIGTERM/SIGINT before force-stopping. "+
+			"Set to 0 to disable (drain forever).")
 	opts := zap.Options{
 		Development: true,
 	}
@@ -154,24 +160,28 @@ func main() {
 		metricsServerOptions.KeyName = metricsCertKey
 	}
 
+	// gracefulTimeout is wired into the manager so on SIGTERM/SIGINT it stops
+	// accepting new work and waits up to this long for in-flight reconciles to
+	// finish before force-stopping. controller-runtime's SetupSignalHandler also
+	// installs a second-signal force-kill — pressing Ctrl-C twice exits now.
+	var gracefulTimeout *time.Duration
+	if gracefulShutdownTimeout > 0 {
+		gracefulTimeout = &gracefulShutdownTimeout
+	}
+
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
-		Scheme:                 scheme,
-		Metrics:                metricsServerOptions,
-		WebhookServer:          webhookServer,
-		HealthProbeBindAddress: probeAddr,
-		LeaderElection:         enableLeaderElection,
-		LeaderElectionID:       "ab130378.compute.example.com",
-		// LeaderElectionReleaseOnCancel defines if the leader should step down voluntarily
-		// when the Manager ends. This requires the binary to immediately end when the
-		// Manager is stopped, otherwise, this setting is unsafe. Setting this significantly
-		// speeds up voluntary leader transitions as the new leader don't have to wait
-		// LeaseDuration time first.
-		//
-		// In the default scaffold provided, the program ends immediately after
-		// the manager stops, so would be fine to enable this option. However,
-		// if you are doing or is intended to do any operation such as perform cleanups
-		// after the manager stops then its usage might be unsafe.
-		// LeaderElectionReleaseOnCancel: true,
+		Scheme:                  scheme,
+		Metrics:                 metricsServerOptions,
+		WebhookServer:           webhookServer,
+		HealthProbeBindAddress:  probeAddr,
+		LeaderElection:          enableLeaderElection,
+		LeaderElectionID:        "ab130378.compute.example.com",
+		GracefulShutdownTimeout: gracefulTimeout,
+		// Step down voluntarily on shutdown so a freshly-rolled replica can
+		// take leadership immediately instead of waiting for LeaseDuration to
+		// expire. Safe because we have no post-Stop cleanup work — the deferred
+		// shutdown log below is the only thing that runs after Start() returns.
+		LeaderElectionReleaseOnCancel: enableLeaderElection,
 	})
 	if err != nil {
 		setupLog.Error(err, "Failed to start manager")
@@ -192,6 +202,20 @@ func main() {
 		setupLog.Error(err, "Failed to create controller", "controller", "trainingrun")
 		os.Exit(1)
 	}
+	// nolint:goconst
+	if os.Getenv("ENABLE_WEBHOOKS") != "false" {
+		if err := webhookv1alpha1.SetupSparkJobWebhookWithManager(mgr); err != nil {
+			setupLog.Error(err, "Failed to create webhook", "webhook", "SparkJob")
+			os.Exit(1)
+		}
+	}
+	// nolint:goconst
+	if os.Getenv("ENABLE_WEBHOOKS") != "false" {
+		if err := webhookv1alpha1.SetupTrainingRunWebhookWithManager(mgr); err != nil {
+			setupLog.Error(err, "Failed to create webhook", "webhook", "TrainingRun")
+			os.Exit(1)
+		}
+	}
 	// +kubebuilder:scaffold:builder
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
@@ -203,8 +227,23 @@ func main() {
 		os.Exit(1)
 	}
 
-	setupLog.Info("Starting manager")
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+	// SetupSignalHandler returns a context that is cancelled on the first
+	// SIGTERM/SIGINT. A second signal calls os.Exit(1) immediately so a stuck
+	// reconcile can't keep the pod alive past kubelet's termination grace
+	// period.
+	ctx := ctrl.SetupSignalHandler()
+
+	setupLog.Info("Starting manager",
+		"gracefulShutdownTimeout", gracefulShutdownTimeout,
+		"leaderElection", enableLeaderElection)
+
+	// On Start() return we log the outcome. controller-runtime cancels the
+	// passed context, drains all controllers (bounded by GracefulShutdownTimeout),
+	// releases the leader lock (if held), then returns. Anything that needs to
+	// run after that goes here.
+	defer setupLog.Info("Manager stopped cleanly")
+
+	if err := mgr.Start(ctx); err != nil {
 		setupLog.Error(err, "Failed to run manager")
 		os.Exit(1)
 	}
