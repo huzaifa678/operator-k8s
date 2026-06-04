@@ -31,6 +31,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	computev1alpha1 "github.com/huzaifa678/compute-operator/api/v1alpha1"
+	"github.com/huzaifa678/compute-operator/internal/metrics"
 )
 
 const trainingScriptKey = "train.py"
@@ -52,11 +53,22 @@ type TrainingRunReconciler struct {
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 
-func (r *TrainingRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *TrainingRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, retErr error) {
 	log := logf.FromContext(ctx)
+
+	defer func() {
+		outcome := "success"
+		if retErr != nil {
+			outcome = "error"
+		}
+		metrics.TrainingRunReconciles.WithLabelValues(outcome).Inc()
+	}()
 
 	var run computev1alpha1.TrainingRun
 	if err := r.Get(ctx, req.NamespacedName, &run); err != nil {
+		if apierrors.IsNotFound(err) {
+			metrics.DeleteTraining(req.Namespace, req.Name)
+		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
@@ -233,6 +245,13 @@ func (r *TrainingRunReconciler) updateTrainingStatus(ctx context.Context, run *c
 
 	run.Status.EstimatedCostUSD = estimateCost(run.Status.StartTime, run.Status.CompletionTime,
 		run.Spec.WorldSize, run.Spec.ResourceHint.CostPerHourUSD)
+
+	metrics.SetTrainingPhase(run.Namespace, run.Name, string(run.Status.Phase))
+	metrics.TrainingRunWorkersReady.WithLabelValues(run.Namespace, run.Name).Set(float64(ready))
+	metrics.TrainingRunResumes.WithLabelValues(run.Namespace, run.Name).Set(float64(run.Status.Resumes))
+	if cost, err := strconv.ParseFloat(run.Status.EstimatedCostUSD, 64); err == nil {
+		metrics.TrainingRunCostUSD.WithLabelValues(run.Namespace, run.Name).Set(cost)
+	}
 
 	if equalTrainingStatus(prev, &run.Status) {
 		return nil

@@ -53,11 +53,37 @@ Pushed nothing yet, want to test? Sync from your working tree:
 # Push the local Kustomize output directly to ArgoCD without committing
 argocd app sync compute-operator --local ./config/default
 
-# Same for samples
-argocd app sync samples --local ./config/samples
+# Same for samples — re-run the SparkPi / TrainingRun without a git push
+argocd app sync samples --local ./config/samples --force --replace --prune
 ```
 
 ArgoCD diffs your local files against the live cluster state and applies the delta. Next git-driven sync will overwrite anything you pushed this way — useful for "does my change work?" without polluting history.
+
+**`--local` is also the answer for "the repo isn't on GitHub yet."** If `argocd app get samples` reports
+
+```
+ComparisonError  failed to list refs: authentication required: Repository not found.
+```
+
+it means the `repoURL` in `applications/samples.yaml` points at a repo Argo can't reach (private, or doesn't exist on GitHub yet). The `--local` path skips git entirely and uploads your laptop's working tree directly to argocd-server, so you can keep using the operator before the repo is public.
+
+> Important: `--local` does **not** work with `--core` mode (it needs the argocd-server gRPC API). You have to log in first:
+>
+> ```bash
+> # Terminal 1 — leave running
+> kubectl -n argocd port-forward svc/argocd-server 8080:443
+>
+> # Terminal 2
+> ARGO_PW=$(kubectl -n argocd get secret argocd-initial-admin-secret \
+>   -o jsonpath='{.data.password}' | base64 -d)
+> argocd login localhost:8080 --username admin --password "$ARGO_PW" --insecure
+>
+> argocd app sync samples --local ./config/samples --force --replace --prune
+> # or via the Makefile shortcut:
+> make gitops-sync-samples-local
+> ```
+
+Once you push the repo to GitHub and the Application can clone it, you can switch back to `--core` and use `make gitops-sync` for the normal git-driven flow.
 
 ### Mode 3 — Parameter overrides (`argocd app set`)
 

@@ -35,6 +35,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	computev1alpha1 "github.com/huzaifa678/compute-operator/api/v1alpha1"
+	"github.com/huzaifa678/compute-operator/internal/metrics"
 )
 
 const (
@@ -65,11 +66,23 @@ type SparkJobReconciler struct {
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles;rolebindings,verbs=get;list;watch;create;update;patch;delete
 
-func (r *SparkJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+func (r *SparkJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, retErr error) {
 	log := logf.FromContext(ctx)
+
+	defer func() {
+		outcome := "success"
+		if retErr != nil {
+			outcome = "error"
+		}
+		metrics.SparkJobReconciles.WithLabelValues(outcome).Inc()
+	}()
 
 	var job computev1alpha1.SparkJob
 	if err := r.Get(ctx, req.NamespacedName, &job); err != nil {
+		if apierrors.IsNotFound(err) {
+			// CR was deleted — drop its gauges so we don't keep scraping stale series.
+			metrics.DeleteSpark(req.Namespace, req.Name)
+		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
@@ -286,6 +299,16 @@ func (r *SparkJobReconciler) updateStatus(ctx context.Context, job *computev1alp
 
 	job.Status.EstimatedCostUSD = estimateCost(job.Status.StartTime, job.Status.CompletionTime,
 		1+running, job.Spec.ResourceHint.CostPerHourUSD)
+
+	// Emit metrics whether or not status changed — Prometheus needs the
+	// latest sample for "now" even when no field shifted.
+	metrics.SetSparkPhase(job.Namespace, job.Name, string(job.Status.Phase))
+	metrics.SparkJobExecutorsRunning.WithLabelValues(job.Namespace, job.Name).Set(float64(running))
+	metrics.SparkJobExecutorsDesired.WithLabelValues(job.Namespace, job.Name).Set(float64(desired))
+	metrics.SparkJobRetries.WithLabelValues(job.Namespace, job.Name).Set(float64(job.Status.Retries))
+	if cost, err := strconv.ParseFloat(job.Status.EstimatedCostUSD, 64); err == nil {
+		metrics.SparkJobCostUSD.WithLabelValues(job.Namespace, job.Name).Set(cost)
+	}
 
 	if equalStatus(prev, &job.Status) {
 		return nil

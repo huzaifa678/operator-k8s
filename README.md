@@ -163,6 +163,7 @@ flowchart TD
 | `api/v1alpha1/` | Go types — source of truth for both CRDs |
 | `internal/controller/` | Reconcilers + unit/integration tests (envtest) |
 | `internal/webhook/v1alpha1/` | Validating admission webhooks + their tests |
+| `internal/metrics/` | Custom Prometheus metrics + helpers |
 | `cmd/main.go` | Manager entrypoint (registers both controllers + webhooks) |
 | `config/` | Kustomize manifests (CRDs, RBAC, Deployment, samples) |
 | `config/samples/` | Working `SparkJob` and `TrainingRun` CRs |
@@ -517,6 +518,120 @@ helm upgrade --install compute-op ./dist/chart \
 
 ---
 
+## Observability (Prometheus + Grafana)
+
+The controller emits custom domain metrics on top of the controller-runtime defaults. With kube-prometheus-stack installed, every `SparkJob` and `TrainingRun` shows up as live timeseries.
+
+### What's emitted
+
+`/metrics` on the manager pod (`:8443` HTTPS or `:8080` HTTP depending on `--metrics-secure`) carries:
+
+| Metric | Type | Labels | What it tells you |
+|--------|------|--------|-------------------|
+| `compute_operator_sparkjob_reconciles_total` | counter | `result` (success/error) | Reconcile traffic + error rate |
+| `compute_operator_sparkjob_phase` | gauge | `namespace`, `name`, `phase` | 1 for the active phase, 0 for others — clean step function per job |
+| `compute_operator_sparkjob_executors_running` | gauge | `namespace`, `name` | Live executor pod count |
+| `compute_operator_sparkjob_executors_desired` | gauge | `namespace`, `name` | What the auto-tuner wants — diff vs running shows scheduling drag |
+| `compute_operator_sparkjob_retries_total` | gauge | `namespace`, `name` | Spot-retry attempts consumed |
+| `compute_operator_sparkjob_cost_usd` | gauge | `namespace`, `name` | Live cost estimate |
+| `compute_operator_trainingrun_*` | (mirrors of the above) | | Same shape for `TrainingRun` |
+
+Plus everything controller-runtime exposes by default: `controller_runtime_reconcile_*`, `workqueue_*`, `rest_client_*`, Go runtime metrics, leader-election status.
+
+### Install the stack (one-time per cluster)
+
+Three variants depending on your cluster and how much you care about admission validation:
+
+| Command | Admission webhooks | Cert source | Works on |
+|---------|--------------------|-------------|----------|
+| `make install-prometheus` | **ON** | `kube-webhook-certgen` Job | Real clusters (EKS / GKE / on-prem) |
+| `make install-prometheus-local` | **OFF** | — | k3d / k3s / kind (skips the broken Job) |
+| `make install-prometheus-certmanager` | **ON** | cert-manager-issued | k3d **+** real clusters (proper path) |
+
+```bash
+# Real cluster
+make install-prometheus
+
+# k3d, give up on webhook validation
+make install-prometheus-local
+
+# k3d, keep webhook validation — installs cert-manager first, then the chart
+make install-prometheus-certmanager
+
+# Then in any case:
+make enable-metrics-monitoring
+```
+
+Why three? The chart's bundled `kube-webhook-certgen` Job creates the webhook TLS cert at install time, but on k3d/k3s it 401s against the API server because of how those distros project ServiceAccount tokens. The recommended fix in production is **cert-manager** — it owns cert lifecycle properly, works everywhere, and avoids the init Job altogether. `install-prometheus-certmanager` is the one-shot target that bootstraps cert-manager **and** the Prometheus stack wired to use it.
+
+The `_*local*_` variant is purely a convenience: drop the admission webhooks (you lose nothing for monitoring purposes — they only validate `ServiceMonitor`/`Prometheus`/`Alertmanager` CRs you create) and skip the cert-manager dependency entirely.
+
+You can also flip the toggles on the main target directly:
+
+```bash
+make install-prometheus PROM_ADMISSION_WEBHOOKS=false                  # same as -local
+make install-prometheus PROM_ADMISSION_WEBHOOKS=true PROM_USE_CERTMANAGER=true   # same as -certmanager (assumes cert-manager already installed)
+```
+
+The chart is installed with `serviceMonitorSelectorNilUsesHelmValues=false` so it discovers any `ServiceMonitor` in any namespace — no extra labels needed on ours.
+
+### Open the dashboards
+
+```bash
+make prometheus-ui     # http://localhost:9090
+make grafana-ui        # http://localhost:3000  user: admin  pass: prom-operator
+```
+
+In Prometheus UI, check `Status → Targets` — you should see `controller-manager-metrics-monitor` listed as `UP`.
+
+Useful PromQL to try in the **Graph** tab:
+
+```promql
+# Phase timeline for every SparkJob
+compute_operator_sparkjob_phase == 1
+
+# Reconcile error rate over the last 5 min
+rate(compute_operator_sparkjob_reconciles_total{result="error"}[5m])
+
+# Total spend across all jobs right now
+sum(compute_operator_sparkjob_cost_usd) + sum(compute_operator_trainingrun_cost_usd)
+
+# Auto-tuner drag — desired vs running executors per job
+compute_operator_sparkjob_executors_desired - compute_operator_sparkjob_executors_running
+```
+
+### Grafana dashboard
+
+Grafana auto-discovers Prometheus as a datasource. You can either:
+- Use the kube-prometheus-stack's pre-canned **Kubernetes / Compute Resources / Namespace (Workloads)** to see the controller's CPU/memory/restart timeline, or
+- Build a custom dashboard using the PromQL above. The metric naming is `compute_operator_*` so it auto-completes cleanly in the metric browser.
+
+### Troubleshooting
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `controller-manager-metrics-monitor` target missing in Prometheus | ServiceMonitor not applied or wrong selector | `kubectl get servicemonitor -A \| grep controller-manager`; if missing, `make enable-metrics-monitoring`. |
+| Target shows `DOWN` with `tls: failed to verify certificate` | The default `monitor.yaml` uses `insecureSkipVerify: true` — that should work. If you uncommented the `monitor_tls_patch.yaml` patch but didn't install cert-manager, scraping fails on the cert verification step. | Either install cert-manager (the patch references its issued secret) or revert to the default `monitor.yaml`. |
+| `compute_operator_*` metrics show up but never increment | Controller can't connect to the API server, so reconciles never run | `kubectl -n compute-operator-system logs deployment/controller-manager` |
+| Stale metrics linger after deleting a CR | Cleanup races with deletion | The reconciler calls `metrics.DeleteSpark` / `DeleteTraining` on NotFound — wait one reconcile cycle. |
+
+### Local-only smoke test (no cluster Prometheus)
+
+When running `make run` locally, scrape the controller directly:
+
+```bash
+# Enable metrics on a plain HTTP port for easy curl-ing
+go run ./cmd/main.go --metrics-bind-address=:8080 --metrics-secure=false
+
+# In another terminal:
+curl -s localhost:8080/metrics | grep compute_operator_
+# compute_operator_sparkjob_reconciles_total{result="success"} 17
+# compute_operator_sparkjob_phase{name="sparkpi-sample",namespace="default",phase="Running"} 1
+# ...
+```
+
+---
+
 ## CR validation (admission webhook)
 
 Both CRDs have a **validating admission webhook** (`internal/webhook/v1alpha1/`) that runs on every `CREATE` and `UPDATE` and rejects semantically invalid CRs before they reach the controller. This catches things kubebuilder's OpenAPI markers can't express.
@@ -613,7 +728,7 @@ Pick from "High" before claiming this is production-ready. The webhook + the `hu
 - [x] Graceful shutdown in `cmd/main.go` — `--graceful-shutdown-timeout` flag drains in-flight reconciles before exit, releases leader lock cleanly
 - [x] ArgoCD setup — `gitops/` with `Application` + `ApplicationSet` manifests, `make install-argocd`, `make gitops-bootstrap`, local-sync escape hatches (see [`gitops/README.md`](gitops/README.md))
 - [x] Validating admission webhooks for both CRDs — 15 unit tests at 91.6% coverage
+- [x] Prometheus metrics — domain-specific `compute_operator_*` counters/gauges, `make install-prometheus` + `make enable-metrics-monitoring`, port-forward helpers for Prometheus/Grafana UIs
 - [ ] Real checkpoint manager (MinIO + S3-compatible) wired to `spec.checkpoint`
 - [ ] NodeTerminating-taint watcher → checkpoint before spot eviction
 - [ ] Airflow `DAGRun` CRD (third controller)
-- [ ] Prometheus metrics on the manager (the chart already has the ServiceMonitor)

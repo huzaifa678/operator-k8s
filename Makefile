@@ -183,6 +183,115 @@ deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in
 undeploy: kustomize ## Undeploy controller from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
 	"$(KUSTOMIZE)" build config/default | "$(KUBECTL)" delete --ignore-not-found=$(ignore-not-found) -f -
 
+##@ Observability (Prometheus + Grafana)
+
+PROM_NAMESPACE        ?= monitoring
+PROM_RELEASE          ?= kube-prom
+KUBE_PROM_VERSION     ?= 65.0.0   # kube-prometheus-stack chart version
+CERT_MANAGER_VERSION  ?= v1.16.1
+# Whether to install the Prometheus Operator's own admission webhooks
+# (validates ServiceMonitor/Prometheus/Alertmanager CRs). ON by default for
+# real clusters; the `install-prometheus-local` target flips it OFF for
+# k3d/k3s where the bundled kube-webhook-certgen Job can't authenticate.
+PROM_ADMISSION_WEBHOOKS ?= true
+# When true, the Prometheus Operator's admission webhook gets its TLS cert
+# from cert-manager instead of the kube-webhook-certgen Job — the only way
+# to keep webhooks ON on k3d. Requires `make install-cert-manager` first.
+PROM_USE_CERTMANAGER ?= false
+
+.PHONY: _helm-repo-prometheus
+_helm-repo-prometheus:
+	@# repo add + update are flaky on slow connections — retry up to 3 times
+	@for i in 1 2 3; do \
+	  helm repo add prometheus-community https://prometheus-community.github.io/helm-charts && break || \
+	    { echo "[helm-repo] repo add failed (attempt $$i/3), retrying in 5s..."; sleep 5; }; \
+	done
+	@for i in 1 2 3; do \
+	  helm repo update prometheus-community && break || \
+	    { echo "[helm-repo] repo update failed (attempt $$i/3), retrying in 5s..."; sleep 5; }; \
+	done
+
+.PHONY: _helm-repo-jetstack
+_helm-repo-jetstack:
+	@for i in 1 2 3; do \
+	  helm repo add jetstack https://charts.jetstack.io && break || \
+	    { echo "[helm-repo] jetstack repo add failed (attempt $$i/3), retrying in 5s..."; sleep 5; }; \
+	done
+	@for i in 1 2 3; do \
+	  helm repo update jetstack && break || \
+	    { echo "[helm-repo] jetstack repo update failed (attempt $$i/3), retrying in 5s..."; sleep 5; }; \
+	done
+
+.PHONY: install-cert-manager
+install-cert-manager: _helm-repo-jetstack ## Install cert-manager via Helm. Required when PROM_USE_CERTMANAGER=true.
+	helm upgrade --install --wait --timeout 5m \
+		--namespace cert-manager --create-namespace \
+		--version $(CERT_MANAGER_VERSION) \
+		cert-manager jetstack/cert-manager \
+		--set crds.enabled=true
+	@echo "[install-cert-manager] cert-manager $(CERT_MANAGER_VERSION) installed:"
+	@$(KUBECTL) -n cert-manager get pods
+
+.PHONY: uninstall-cert-manager
+uninstall-cert-manager: ## Remove cert-manager.
+	helm uninstall -n cert-manager cert-manager || true
+	$(KUBECTL) delete ns cert-manager --ignore-not-found
+
+.PHONY: install-prometheus
+install-prometheus: _helm-repo-prometheus ## Install kube-prometheus-stack. PROM_ADMISSION_WEBHOOKS=true|false, PROM_USE_CERTMANAGER=true|false.
+	@if [ "$(PROM_USE_CERTMANAGER)" = "true" ] && ! $(KUBECTL) get deployment -n cert-manager cert-manager-webhook >/dev/null 2>&1; then \
+	  echo "[install-prometheus] PROM_USE_CERTMANAGER=true but cert-manager is not installed."; \
+	  echo "                     Run \`make install-cert-manager\` first."; \
+	  exit 1; \
+	fi
+	helm upgrade --install --wait --timeout 10m \
+		--namespace $(PROM_NAMESPACE) --create-namespace \
+		--version $(KUBE_PROM_VERSION) \
+		$(PROM_RELEASE) prometheus-community/kube-prometheus-stack \
+		--set prometheus.prometheusSpec.serviceMonitorSelectorNilUsesHelmValues=false \
+		--set prometheus.prometheusSpec.podMonitorSelectorNilUsesHelmValues=false \
+		--set prometheusOperator.admissionWebhooks.enabled=$(PROM_ADMISSION_WEBHOOKS) \
+		--set prometheusOperator.admissionWebhooks.patch.enabled=$(if $(filter true,$(PROM_USE_CERTMANAGER)),false,$(PROM_ADMISSION_WEBHOOKS)) \
+		--set prometheusOperator.admissionWebhooks.certManager.enabled=$(PROM_USE_CERTMANAGER) \
+		--set prometheusOperator.tls.enabled=$(PROM_ADMISSION_WEBHOOKS)
+	@echo
+	@echo "Prometheus + Grafana up."
+	@echo "  admission webhooks: $(PROM_ADMISSION_WEBHOOKS)   cert source: $(if $(filter true,$(PROM_USE_CERTMANAGER)),cert-manager,kube-webhook-certgen Job)"
+	@echo "  kubectl -n $(PROM_NAMESPACE) get pods"
+	@echo "  make prometheus-ui   # http://localhost:9090"
+	@echo "  make grafana-ui      # http://localhost:3000  admin / prom-operator"
+
+.PHONY: install-prometheus-local
+install-prometheus-local: ## Install kube-prometheus-stack for k3d/k3s/kind — admission webhooks OFF (no cert-manager dependency).
+	$(MAKE) install-prometheus PROM_ADMISSION_WEBHOOKS=false
+
+.PHONY: install-prometheus-certmanager
+install-prometheus-certmanager: install-cert-manager ## Install kube-prometheus-stack with admission webhooks ON, certs from cert-manager (works on k3d).
+	$(MAKE) install-prometheus PROM_ADMISSION_WEBHOOKS=true PROM_USE_CERTMANAGER=true
+
+.PHONY: enable-metrics-monitoring
+enable-metrics-monitoring: ## Apply the ServiceMonitor so Prometheus scrapes the controller (requires kube-prometheus-stack).
+	$(KUBECTL) apply -k config/prometheus
+	@echo
+	@echo "ServiceMonitor applied. Verify scrape target:"
+	@echo "  kubectl -n $(PROM_NAMESPACE) port-forward svc/$(PROM_RELEASE)-kube-promet-prometheus 9090:9090"
+	@echo "  open http://localhost:9090/targets  and look for controller-manager-metrics-monitor"
+
+.PHONY: prometheus-ui
+prometheus-ui: ## Port-forward Prometheus to http://localhost:9090.
+	@echo "Prometheus at http://localhost:9090 (Ctrl-C to stop)"
+	$(KUBECTL) -n $(PROM_NAMESPACE) port-forward svc/$(PROM_RELEASE)-kube-promet-prometheus 9090:9090
+
+.PHONY: grafana-ui
+grafana-ui: ## Port-forward Grafana to http://localhost:3000 (admin / prom-operator).
+	@echo "Grafana at http://localhost:3000  admin / prom-operator  (Ctrl-C to stop)"
+	$(KUBECTL) -n $(PROM_NAMESPACE) port-forward svc/$(PROM_RELEASE)-grafana 3000:80
+
+.PHONY: uninstall-prometheus
+uninstall-prometheus: ## Remove the kube-prometheus-stack release.
+	helm uninstall -n $(PROM_NAMESPACE) $(PROM_RELEASE) || true
+	$(KUBECTL) delete ns $(PROM_NAMESPACE) --ignore-not-found
+
 ##@ GitOps (ArgoCD)
 
 ARGOCD_NAMESPACE ?= argocd
@@ -214,7 +323,12 @@ gitops-sync: ## Trigger a sync of every compute-operator-owned Application.
 
 .PHONY: gitops-sync-local
 gitops-sync-local: ## Sync the controller from the local working tree (no git push required).
-	argocd app sync compute-operator --local ./config/default
+	@# argocd resolves --local from / not CWD; absolute path avoids "no such directory".
+	argocd app sync compute-operator --local "$(CURDIR)/config/default"
+
+.PHONY: gitops-sync-samples-local
+gitops-sync-samples-local: ## Sync sample CRs from the local working tree (no git push required). Requires argocd login.
+	argocd app sync samples --local "$(CURDIR)/config/samples" --force --replace --prune
 
 .PHONY: gitops-sync-samples
 gitops-sync-samples: ## Sync only the sample CRs (manual trigger; matches the no-auto-sync policy).
