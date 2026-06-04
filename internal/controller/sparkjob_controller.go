@@ -92,19 +92,19 @@ func (r *SparkJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (c
 	driver := &corev1.Pod{}
 	err = r.Get(ctx, types.NamespacedName{Namespace: job.Namespace, Name: driverName}, driver)
 	switch {
-		case apierrors.IsNotFound(err):
-			driver = buildDriverPod(&job, driverName, saName, desired)
-			if err := controllerutil.SetControllerReference(&job, driver, r.Scheme); err != nil {
-				return ctrl.Result{}, err
-			}
-			if err := r.Create(ctx, driver); err != nil {
-				return ctrl.Result{}, fmt.Errorf("create driver: %w", err)
-			}
-			log.Info("created spark-submit driver pod", "pod", driverName,
-				"executors", desired, "main", job.Spec.MainApplicationFile)
-			return ctrl.Result{RequeueAfter: requeueNormal}, nil
-		case err != nil:
+	case apierrors.IsNotFound(err):
+		driver = buildDriverPod(&job, driverName, saName, desired)
+		if err := controllerutil.SetControllerReference(&job, driver, r.Scheme); err != nil {
 			return ctrl.Result{}, err
+		}
+		if err := r.Create(ctx, driver); err != nil {
+			return ctrl.Result{}, fmt.Errorf("create driver: %w", err)
+		}
+		log.Info("created spark-submit driver pod", "pod", driverName,
+			"executors", desired, "main", job.Spec.MainApplicationFile)
+		return ctrl.Result{RequeueAfter: requeueNormal}, nil
+	case err != nil:
+		return ctrl.Result{}, err
 	}
 
 	if err := r.updateStatus(ctx, &job, driver, desired); err != nil {
@@ -259,32 +259,32 @@ func (r *SparkJobReconciler) updateStatus(ctx context.Context, job *computev1alp
 	job.Status.DriverPod = driver.Name
 
 	switch driver.Status.Phase {
-		case corev1.PodPending:
-			job.Status.Phase = computev1alpha1.PhasePending
-		case corev1.PodRunning:
-			job.Status.Phase = computev1alpha1.PhaseRunning
-			if job.Status.StartTime == nil {
-				now := metav1.Now()
-				job.Status.StartTime = &now
-			}
-		case corev1.PodSucceeded:
-			job.Status.Phase = computev1alpha1.PhaseSucceeded
+	case corev1.PodPending:
+		job.Status.Phase = computev1alpha1.PhasePending
+	case corev1.PodRunning:
+		job.Status.Phase = computev1alpha1.PhaseRunning
+		if job.Status.StartTime == nil {
+			now := metav1.Now()
+			job.Status.StartTime = &now
+		}
+	case corev1.PodSucceeded:
+		job.Status.Phase = computev1alpha1.PhaseSucceeded
+		if job.Status.CompletionTime == nil {
+			now := metav1.Now()
+			job.Status.CompletionTime = &now
+		}
+	case corev1.PodFailed:
+		if job.Status.Retries < job.Spec.Spot.MaxRetries {
+			job.Status.Retries++
+			_ = r.Delete(ctx, driver)
+			job.Status.Phase = computev1alpha1.PhaseResuming
+		} else {
+			job.Status.Phase = computev1alpha1.PhaseFailed
 			if job.Status.CompletionTime == nil {
 				now := metav1.Now()
 				job.Status.CompletionTime = &now
 			}
-		case corev1.PodFailed:
-			if job.Status.Retries < job.Spec.Spot.MaxRetries {
-				job.Status.Retries++
-				_ = r.Delete(ctx, driver)
-				job.Status.Phase = computev1alpha1.PhaseResuming
-			} else {
-				job.Status.Phase = computev1alpha1.PhaseFailed
-				if job.Status.CompletionTime == nil {
-					now := metav1.Now()
-					job.Status.CompletionTime = &now
-				}
-			}
+		}
 	}
 
 	job.Status.EstimatedCostUSD = estimateCost(job.Status.StartTime, job.Status.CompletionTime,
