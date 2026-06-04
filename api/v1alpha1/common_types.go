@@ -63,6 +63,45 @@ type ResourceHint struct {
 	CostPerHourUSD string `json:"costPerHourUSD,omitempty"`
 }
 
+// GPUSpec is the high-level GPU request. The controller translates it into
+// pod resource limits, node selector, runtime class, tolerations, and the
+// right torchrun --nproc_per_node value. Assumes the NVIDIA GPU Operator
+// (or equivalent device-plugin + driver stack) is installed on the cluster;
+// see `make install-gpu-operator`.
+type GPUSpec struct {
+	// If false, no GPU plumbing is added (CPU-only run). Defaults to false.
+	// +optional
+	// +kubebuilder:default=false
+	Enabled bool `json:"enabled,omitempty"`
+
+	// GPUs requested per worker pod. Becomes nvidia.com/gpu in resources and
+	// torchrun --nproc_per_node. Defaults to 1.
+	// +optional
+	// +kubebuilder:default=1
+	// +kubebuilder:validation:Minimum=1
+	PerWorker int32 `json:"perWorker,omitempty"`
+
+	// Node selector applied so the pod only schedules on GPU nodes.
+	// Defaults to {"nvidia.com/gpu.present": "true"} which the NVIDIA GPU
+	// Operator labels GPU nodes with.
+	// +optional
+	NodeSelector map[string]string `json:"nodeSelector,omitempty"`
+
+	// RuntimeClass for the pod. Set this to "nvidia" on clusters where the
+	// NVIDIA container runtime is registered as a RuntimeClass. Empty leaves
+	// runtimeClassName unset (works on clusters where nvidia is the default
+	// runtime, e.g. nodes configured with nvidia-container-toolkit's
+	// default-runtime).
+	// +optional
+	RuntimeClass string `json:"runtimeClass,omitempty"`
+
+	// Collective backend for torch.distributed. Defaults to nccl when GPUs
+	// are present (required for inter-GPU all-reduce), gloo otherwise.
+	// +optional
+	// +kubebuilder:validation:Enum=nccl;gloo;mpi
+	Backend string `json:"backend,omitempty"`
+}
+
 // Phase is a coarse high-level status shared by both CRDs.
 // +kubebuilder:validation:Enum=Pending;Running;Checkpointing;Resuming;Succeeded;Failed
 type Phase string

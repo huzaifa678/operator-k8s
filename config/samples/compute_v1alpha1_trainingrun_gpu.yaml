@@ -1,40 +1,52 @@
+# GPU variant of the BERT-tiny TrainingRun.
+# Requires:
+#   1. A real cluster with NVIDIA GPU nodes (k3d has none).
+#   2. The NVIDIA GPU Operator installed:    make install-gpu-operator
+#      (this brings up the device plugin, drivers, runtime class, node labels)
+# The controller turns spec.gpu into:
+#   - resources.requests/limits: nvidia.com/gpu: <perWorker>
+#   - nodeSelector: nvidia.com/gpu.present=true   (labelled by the GPU Operator)
+#   - runtimeClassName: nvidia                    (registered by the GPU Operator)
+#   - toleration for the nvidia.com/gpu:NoSchedule taint
+#   - torchrun --nproc_per_node=<perWorker>
+#   - TORCH_DISTRIBUTED_DEFAULT_BACKEND=nccl  (instead of gloo)
 apiVersion: compute.compute.example.com/v1alpha1
 kind: TrainingRun
 metadata:
-  name: bert-tiny-ddp
+  name: bert-tiny-ddp-gpu 
 spec:
   framework: PyTorch
-  # pytorch/pytorch ships torch + CUDA; runs on CPU too (we use gloo backend).
-  # Image is ~5GB — pre-pull with: docker pull pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
-  # then: k3d image import pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime -c compute-op
-  # it is feasible on GPU access a side note to be aware of
   image: pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
-  worldSize: 2
+  worldSize: 2                # 2 worker pods
+  gpu:
+    enabled: true
+    perWorker: 1              # 1 GPU per pod -> 2 GPUs total, nproc_per_node=1
+    runtimeClass: nvidia
+    backend: nccl
+    # nodeSelector defaults to {"nvidia.com/gpu.present":"true"} if omitted.
+    # Override here for non-GPU-Operator clusters, e.g.:
+    # nodeSelector:
+    #   accelerator: a100
   workerResources:
     requests:
-      cpu: "500m"
-      memory: "2Gi"
+      cpu: "2"
+      memory: "8Gi"
     limits:
-      memory: "4Gi"
-  # transformers pulls the BERT model + tokenizer from HF Hub on first run.
+      memory: "16Gi"
   packages:
     - transformers==4.44.2
   resourceHint:
-    costPerHourUSD: "0.20"
+    costPerHourUSD: "2.50"    # rough A10G / T4 on-demand rate
   spot:
-    enabled: false
-    maxRetries: 2
-  checkpoint:
-    enabled: false
+    enabled: true             # GPU spot instances are where the savings live
+    mode: Preferred
+    maxRetries: 3
   env:
     - { name: PYTHONUNBUFFERED, value: "1" }
     - { name: TRANSFORMERS_VERBOSITY, value: "error" }
-    # Force gloo (CPU collective backend) since k3d has no GPUs.
-    - { name: TORCH_DISTRIBUTED_DEFAULT_BACKEND, value: "gloo" }
+    - { name: NCCL_DEBUG, value: "WARN" }
   script: |
-    """Toy distributed fine-tune of bert-tiny on a hard-coded 2-class dataset.
-    Demonstrates the controller's torchrun + headless-svc + ranked DNS plumbing
-    end to end on CPU. Replace with your real script in production. Tweakable or changable to your needs"""
+    """Same toy bert-tiny fine-tune as the CPU variant, but uses CUDA + NCCL."""
     import os
     import torch
     import torch.distributed as dist
@@ -43,7 +55,7 @@ spec:
     from torch.utils.data import DataLoader, Dataset, DistributedSampler
     from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
-    MODEL = "prajjwal1/bert-tiny"          # ~17 MB pretrained model
+    MODEL = "prajjwal1/bert-tiny"
     EPOCHS = 3
 
     class ToyDataset(Dataset):
@@ -64,16 +76,20 @@ spec:
             return e["input_ids"].squeeze(0), e["attention_mask"].squeeze(0), self.lab[i]
 
     def main():
-        rank       = int(os.environ["RANK"])
-        world_size = int(os.environ["WORLD_SIZE"])
-        backend    = os.environ.get("TORCH_DISTRIBUTED_DEFAULT_BACKEND", "gloo")
+        rank        = int(os.environ["RANK"])
+        world_size  = int(os.environ["WORLD_SIZE"])
+        local_rank  = int(os.environ.get("LOCAL_RANK", "0"))
+        backend     = os.environ.get("TORCH_DISTRIBUTED_DEFAULT_BACKEND", "nccl")
 
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
         dist.init_process_group(backend=backend)
-        print(f"[rank {rank}/{world_size}] handshake OK on backend={backend}", flush=True)
+        print(f"[rank {rank}/{world_size}] CUDA={torch.cuda.is_available()} "
+              f"device={torch.cuda.get_device_name(local_rank)} backend={backend}", flush=True)
 
         tok   = AutoTokenizer.from_pretrained(MODEL)
-        model = AutoModelForSequenceClassification.from_pretrained(MODEL, num_labels=2)
-        model = DDP(model)
+        model = AutoModelForSequenceClassification.from_pretrained(MODEL, num_labels=2).to(device)
+        model = DDP(model, device_ids=[local_rank])
 
         ds      = ToyDataset(tok)
         sampler = DistributedSampler(ds, num_replicas=world_size, rank=rank, shuffle=True)
@@ -83,6 +99,7 @@ spec:
         for epoch in range(EPOCHS):
             sampler.set_epoch(epoch)
             for ids, mask, lab in loader:
+                ids, mask, lab = ids.to(device), mask.to(device), lab.to(device)
                 optim.zero_grad()
                 out = model(input_ids=ids, attention_mask=mask, labels=lab)
                 out.loss.backward()

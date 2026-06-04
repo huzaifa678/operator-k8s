@@ -2,4 +2,5 @@
 resources:
 - compute_v1alpha1_sparkjob.yaml
 - compute_v1alpha1_trainingrun.yaml
+- compute_v1alpha1_trainingrun_gpu.yaml
 # +kubebuilder:scaffold:manifestskustomizesamples

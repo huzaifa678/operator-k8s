@@ -13,7 +13,9 @@ package controller
 import (
 	"context"
 	"fmt"
+	"maps"
 	"strconv"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -31,6 +33,8 @@ import (
 	computev1alpha1 "github.com/huzaifa678/compute-operator/api/v1alpha1"
 )
 
+const trainingScriptKey = "train.py"
+
 const (
 	trainingOwnerLabel = "compute.compute.example.com/trainingrun"
 	rankLabel          = "compute.compute.example.com/rank"
@@ -46,6 +50,7 @@ type TrainingRunReconciler struct {
 // +kubebuilder:rbac:groups=compute.compute.example.com,resources=trainingruns/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
 
 func (r *TrainingRunReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
@@ -62,6 +67,10 @@ func (r *TrainingRunReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 
 	if err := r.ensureHeadlessService(ctx, &run); err != nil {
 		return ctrl.Result{}, fmt.Errorf("svc: %w", err)
+	}
+
+	if err := r.ensureScriptConfigMap(ctx, &run); err != nil {
+		return ctrl.Result{}, fmt.Errorf("script cm: %w", err)
 	}
 
 	workers, err := r.listWorkers(ctx, &run)
@@ -114,6 +123,36 @@ func (r *TrainingRunReconciler) listWorkers(ctx context.Context, run *computev1a
 		return nil, err
 	}
 	return pods.Items, nil
+}
+
+// ensureScriptConfigMap creates (or updates) a ConfigMap holding the inline
+// training script. No-op when spec.script is empty.
+func (r *TrainingRunReconciler) ensureScriptConfigMap(ctx context.Context, run *computev1alpha1.TrainingRun) error {
+	if run.Spec.Script == "" {
+		return nil
+	}
+	name := run.Name + "-script"
+	desired := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: run.Namespace},
+		Data:       map[string]string{trainingScriptKey: run.Spec.Script},
+	}
+	if err := controllerutil.SetControllerReference(run, desired, r.Scheme); err != nil {
+		return err
+	}
+
+	existing := &corev1.ConfigMap{}
+	err := r.Get(ctx, types.NamespacedName{Namespace: run.Namespace, Name: name}, existing)
+	if apierrors.IsNotFound(err) {
+		return r.Create(ctx, desired)
+	}
+	if err != nil {
+		return err
+	}
+	if existing.Data[trainingScriptKey] == run.Spec.Script {
+		return nil
+	}
+	existing.Data = desired.Data
+	return r.Update(ctx, existing)
 }
 
 func (r *TrainingRunReconciler) ensureHeadlessService(ctx context.Context, run *computev1alpha1.TrainingRun) error {
@@ -198,7 +237,12 @@ func (r *TrainingRunReconciler) updateTrainingStatus(ctx context.Context, run *c
 	if equalTrainingStatus(prev, &run.Status) {
 		return nil
 	}
-	return r.Status().Update(ctx, run)
+	// Conflict is benign — pod watch events fire faster than status writes,
+	// and the next reconcile will pick up the latest resourceVersion.
+	if err := r.Status().Update(ctx, run); err != nil && !apierrors.IsConflict(err) {
+		return err
+	}
+	return nil
 }
 
 func equalTrainingStatus(a, b *computev1alpha1.TrainingRunStatus) bool {
@@ -222,12 +266,45 @@ func buildWorkerPod(run *computev1alpha1.TrainingRun, rank int32) *corev1.Pod {
 	masterAddr := fmt.Sprintf("%s-rank-0.%s-workers.%s.svc.cluster.local",
 		run.Name, run.Name, run.Namespace)
 
+	procPerNode := int32(1)
+	if run.Spec.GPU.Enabled && run.Spec.GPU.PerWorker > 0 {
+		procPerNode = run.Spec.GPU.PerWorker
+	}
+
 	cmd := run.Spec.Command
 	args := run.Spec.Args
 	if len(cmd) == 0 {
-		cmd = []string{"/bin/sh", "-c",
-			fmt.Sprintf("echo worker rank=%d world=%d master=%s && sleep 3600",
-				rank, run.Spec.WorldSize, masterAddr)}
+		switch {
+		case run.Spec.Script != "":
+			// Self-contained mode: pip-install Packages (if any) then torchrun
+			// the mounted /scripts/train.py. Env vars are interpolated by sh.
+			pipInstall := ""
+			if len(run.Spec.Packages) > 0 {
+				pipInstall = "pip install --quiet --no-cache-dir " +
+					strings.Join(run.Spec.Packages, " ") + " && "
+			}
+			torchrun := fmt.Sprintf("exec torchrun"+
+				" --nnodes=$WORLD_SIZE"+
+				" --nproc_per_node=%d"+
+				" --node_rank=$RANK"+
+				" --master_addr=$MASTER_ADDR"+
+				" --master_port=$MASTER_PORT"+
+				" /scripts/%s", procPerNode, trainingScriptKey)
+			cmd = []string{"/bin/sh", "-c", pipInstall + torchrun}
+		default:
+			cmd = []string{"/bin/sh", "-c",
+				fmt.Sprintf("echo worker rank=%d world=%d master=%s && sleep 3600",
+					rank, run.Spec.WorldSize, masterAddr)}
+		}
+	}
+
+	backend := run.Spec.GPU.Backend
+	if backend == "" {
+		if run.Spec.GPU.Enabled {
+			backend = "nccl"
+		} else {
+			backend = "gloo"
+		}
 	}
 
 	env := append([]corev1.EnvVar{
@@ -235,6 +312,7 @@ func buildWorkerPod(run *computev1alpha1.TrainingRun, rank int32) *corev1.Pod {
 		{Name: "WORLD_SIZE", Value: strconv.Itoa(int(run.Spec.WorldSize))},
 		{Name: "MASTER_ADDR", Value: masterAddr},
 		{Name: "MASTER_PORT", Value: "29500"},
+		{Name: "TORCH_DISTRIBUTED_DEFAULT_BACKEND", Value: backend},
 	}, run.Spec.Env...)
 
 	pod := &corev1.Pod{
@@ -265,21 +343,79 @@ func buildWorkerPod(run *computev1alpha1.TrainingRun, rank int32) *corev1.Pod {
 		},
 	}
 
+	applyGPU(pod, run.Spec.GPU)
+
 	if run.Spec.DatasetPVC != "" {
-		pod.Spec.Volumes = []corev1.Volume{{
+		pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
 			Name: "dataset",
 			VolumeSource: corev1.VolumeSource{
 				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
 					ClaimName: run.Spec.DatasetPVC,
 				},
 			},
-		}}
-		pod.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{
-			{Name: "dataset", MountPath: "/data", ReadOnly: true},
-		}
+		})
+		pod.Spec.Containers[0].VolumeMounts = append(pod.Spec.Containers[0].VolumeMounts,
+			corev1.VolumeMount{Name: "dataset", MountPath: "/data", ReadOnly: true})
+	}
+
+	if run.Spec.Script != "" {
+		pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
+			Name: "script",
+			VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{
+						Name: run.Name + "-script",
+					},
+				},
+			},
+		})
+		pod.Spec.Containers[0].VolumeMounts = append(pod.Spec.Containers[0].VolumeMounts,
+			corev1.VolumeMount{Name: "script", MountPath: "/scripts", ReadOnly: true})
 	}
 
 	return pod
+}
+
+// applyGPU mutates the pod in place to add: nvidia.com/gpu resource request +
+// limit (k8s requires both for extended resources), the node selector that
+// targets GPU nodes, the nvidia runtime class if configured, and the standard
+// toleration for the taint the GPU Operator places on GPU nodes.
+func applyGPU(pod *corev1.Pod, g computev1alpha1.GPUSpec) {
+	if !g.Enabled {
+		return
+	}
+	count := max(g.PerWorker, 1)
+	gpuQty := resource.MustParse(strconv.Itoa(int(count)))
+
+	c := &pod.Spec.Containers[0]
+	if c.Resources.Requests == nil {
+		c.Resources.Requests = corev1.ResourceList{}
+	}
+	if c.Resources.Limits == nil {
+		c.Resources.Limits = corev1.ResourceList{}
+	}
+	c.Resources.Requests[corev1.ResourceName("nvidia.com/gpu")] = gpuQty
+	c.Resources.Limits[corev1.ResourceName("nvidia.com/gpu")] = gpuQty
+
+	sel := g.NodeSelector
+	if len(sel) == 0 {
+		sel = map[string]string{"nvidia.com/gpu.present": "true"}
+	}
+	if pod.Spec.NodeSelector == nil {
+		pod.Spec.NodeSelector = map[string]string{}
+	}
+	maps.Copy(pod.Spec.NodeSelector, sel)
+
+	if g.RuntimeClass != "" {
+		rc := g.RuntimeClass
+		pod.Spec.RuntimeClassName = &rc
+	}
+
+	pod.Spec.Tolerations = append(pod.Spec.Tolerations, corev1.Toleration{
+		Key:      "nvidia.com/gpu",
+		Operator: corev1.TolerationOpExists,
+		Effect:   corev1.TaintEffectNoSchedule,
+	})
 }
 
 func workerResources(run *computev1alpha1.TrainingRun) corev1.ResourceRequirements {
@@ -299,6 +435,7 @@ func (r *TrainingRunReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		For(&computev1alpha1.TrainingRun{}).
 		Owns(&corev1.Pod{}, builder.MatchEveryOwner).
 		Owns(&corev1.Service{}).
+		Owns(&corev1.ConfigMap{}).
 		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(mapPodToTrainingOwner)).
 		Named("trainingrun").
 		Complete(r)

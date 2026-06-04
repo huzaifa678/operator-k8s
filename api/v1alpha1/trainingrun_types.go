@@ -56,11 +56,29 @@ type TrainingRunSpec struct {
 	Spot SpotPolicy `json:"spot,omitempty"`
 
 	// +optional
+	GPU GPUSpec `json:"gpu,omitempty"`
+
+	// +optional
 	ResourceHint ResourceHint `json:"resourceHint,omitempty"`
 
 	// Environment variables passed to every worker.
 	// +optional
 	Env []corev1.EnvVar `json:"env,omitempty"`
+
+	// Inline Python training script. If set, the controller materializes it as
+	// a ConfigMap and mounts it at /scripts/train.py on every worker. When
+	// Command is empty, the default command becomes a torchrun invocation
+	// pointing at /scripts/train.py.
+	// Use this for self-contained demos. For production, bake the script into
+	// your image instead.
+	// +optional
+	Script string `json:"script,omitempty"`
+
+	// pip packages installed at container start (before torchrun launches).
+	// Requires the image to have pip on PATH. Skipped if empty.
+	// For production, bake these into the image instead.
+	// +optional
+	Packages []string `json:"packages,omitempty"`
 }
 
 // TrainingRunStatus reflects observed state.

@@ -175,6 +175,45 @@ deploy: manifests kustomize ## Deploy controller to the K8s cluster specified in
 undeploy: kustomize ## Undeploy controller from the K8s cluster specified in ~/.kube/config. Call with ignore-not-found=true to ignore resource not found errors during deletion.
 	"$(KUSTOMIZE)" build config/default | "$(KUBECTL)" delete --ignore-not-found=$(ignore-not-found) -f -
 
+##@ GPU stack
+
+GPU_OPERATOR_VERSION   ?= v24.9.1
+GPU_OPERATOR_NAMESPACE ?= gpu-operator
+# Flip these to false if you ran scripts/install-nvidia-drivers.sh on the host first.
+GPU_DRIVER_ENABLED     ?= true
+GPU_TOOLKIT_ENABLED    ?= true
+
+.PHONY: install-nvidia-drivers
+install-nvidia-drivers: ## (Run on each GPU node) Install host NVIDIA driver + container toolkit.
+	@echo "This must run on the GPU node itself, as root."
+	@echo "Copy scripts/install-nvidia-drivers.sh to the node and run:"
+	@echo "  sudo ./install-nvidia-drivers.sh --reboot"
+
+.PHONY: install-gpu-operator
+install-gpu-operator: ## Install the NVIDIA GPU Operator via Helm (requires GPU nodes in the cluster).
+	helm repo add nvidia https://helm.ngc.nvidia.com/nvidia || true
+	helm repo update nvidia
+	helm upgrade --install --wait \
+		--namespace $(GPU_OPERATOR_NAMESPACE) --create-namespace \
+		--version $(GPU_OPERATOR_VERSION) \
+		gpu-operator nvidia/gpu-operator \
+		--set toolkit.enabled=$(GPU_TOOLKIT_ENABLED) \
+		--set driver.enabled=$(GPU_DRIVER_ENABLED) \
+		--set devicePlugin.enabled=true \
+		--set nodeStatusExporter.enabled=true
+	@echo
+	@echo "GPU Operator installed. Verify with:"
+	@echo "  kubectl -n $(GPU_OPERATOR_NAMESPACE) get pods"
+	@echo "  kubectl get nodes -L nvidia.com/gpu.present -L nvidia.com/gpu.count"
+	@echo
+	@echo "If you pre-installed drivers with scripts/install-nvidia-drivers.sh, re-run with:"
+	@echo "  make install-gpu-operator GPU_DRIVER_ENABLED=false GPU_TOOLKIT_ENABLED=false"
+
+.PHONY: uninstall-gpu-operator
+uninstall-gpu-operator: ## Remove the NVIDIA GPU Operator.
+	helm uninstall -n $(GPU_OPERATOR_NAMESPACE) gpu-operator || true
+	"$(KUBECTL)" delete ns $(GPU_OPERATOR_NAMESPACE) --ignore-not-found
+
 ##@ Dependencies
 
 ## Location to install dependencies to

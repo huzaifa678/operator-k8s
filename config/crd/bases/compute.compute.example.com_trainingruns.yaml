@@ -256,9 +256,64 @@ spec:
                 - PyTorch
                 - Ray
                 type: string
+              gpu:
+                description: |-
+                  GPUSpec is the high-level GPU request. The controller translates it into
+                  pod resource limits, node selector, runtime class, tolerations, and the
+                  right torchrun --nproc_per_node value. Assumes the NVIDIA GPU Operator
+                  (or equivalent device-plugin + driver stack) is installed on the cluster;
+                  see `make install-gpu-operator`.
+                properties:
+                  backend:
+                    description: |-
+                      Collective backend for torch.distributed. Defaults to nccl when GPUs
+                      are present (required for inter-GPU all-reduce), gloo otherwise.
+                    enum:
+                    - nccl
+                    - gloo
+                    - mpi
+                    type: string
+                  enabled:
+                    default: false
+                    description: If false, no GPU plumbing is added (CPU-only run).
+                      Defaults to false.
+                    type: boolean
+                  nodeSelector:
+                    additionalProperties:
+                      type: string
+                    description: |-
+                      Node selector applied so the pod only schedules on GPU nodes.
+                      Defaults to {"nvidia.com/gpu.present": "true"} which the NVIDIA GPU
+                      Operator labels GPU nodes with.
+                    type: object
+                  perWorker:
+                    default: 1
+                    description: |-
+                      GPUs requested per worker pod. Becomes nvidia.com/gpu in resources and
+                      torchrun --nproc_per_node. Defaults to 1.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                  runtimeClass:
+                    description: |-
+                      RuntimeClass for the pod. Set this to "nvidia" on clusters where the
+                      NVIDIA container runtime is registered as a RuntimeClass. Empty leaves
+                      runtimeClassName unset (works on clusters where nvidia is the default
+                      runtime, e.g. nodes configured with nvidia-container-toolkit's
+                      default-runtime).
+                    type: string
+                type: object
               image:
                 description: Container image with the training code + framework.
                 type: string
+              packages:
+                description: |-
+                  pip packages installed at container start (before torchrun launches).
+                  Requires the image to have pip on PATH. Skipped if empty.
+                  For production, bake these into the image instead.
+                items:
+                  type: string
+                type: array
               resourceHint:
                 description: |-
                   ResourceHint lets the auto-tuner make decisions without the user
@@ -275,6 +330,15 @@ spec:
                     format: int64
                     type: integer
                 type: object
+              script:
+                description: |-
+                  Inline Python training script. If set, the controller materializes it as
+                  a ConfigMap and mounts it at /scripts/train.py on every worker. When
+                  Command is empty, the default command becomes a torchrun invocation
+                  pointing at /scripts/train.py.
+                  Use this for self-contained demos. For production, bake the script into
+                  your image instead.
+                type: string
               spot:
                 description: SpotPolicy controls how the controller schedules onto
                   preemptible nodes.

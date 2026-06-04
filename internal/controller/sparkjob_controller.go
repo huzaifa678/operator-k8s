@@ -13,6 +13,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"maps"
 	"sort"
 	"strconv"
 	"strings"
@@ -123,12 +124,8 @@ func desiredExecutorCount(job *computev1alpha1.SparkJob) int32 {
 	}
 	if job.Spec.ResourceHint.InputSizeMB > 0 {
 		n := int32(job.Spec.ResourceHint.InputSizeMB / 256)
-		if n < job.Spec.MinExecutors {
-			n = job.Spec.MinExecutors
-		}
-		if n > job.Spec.MaxExecutors {
-			n = job.Spec.MaxExecutors
-		}
+		n = max(n, job.Spec.MinExecutors)
+		n = min(n, job.Spec.MaxExecutors)
 		return n
 	}
 	if job.Spec.MinExecutors > 0 {
@@ -163,9 +160,9 @@ func (r *SparkJobReconciler) ensureDriverRBAC(ctx context.Context, job *computev
 			{APIGroups: []string{""}, Resources: []string{"pods/log", "pods/exec"},
 				Verbs: []string{"get", "create"}},
 			{APIGroups: []string{""}, Resources: []string{"configmaps", "services"},
-				Verbs: []string{"get", "list", "watch", "create", "delete", "patch"}},
+				Verbs: []string{"get", "list", "watch", "create", "delete", "deletecollection", "patch"}},
 			{APIGroups: []string{""}, Resources: []string{"persistentvolumeclaims"},
-				Verbs: []string{"get", "list", "create", "delete"}},
+				Verbs: []string{"get", "list", "watch", "create", "delete", "deletecollection", "patch"}},
 		},
 	}
 	if err := controllerutil.SetControllerReference(job, role, r.Scheme); err != nil {
@@ -293,7 +290,13 @@ func (r *SparkJobReconciler) updateStatus(ctx context.Context, job *computev1alp
 	if equalStatus(prev, &job.Status) {
 		return nil
 	}
-	return r.Status().Update(ctx, job)
+	// Optimistic concurrency: another reconcile may already be updating the
+	// SparkJob. Ignore conflicts — the next reconcile (which we'll be
+	// re-queued for) will pick up the latest version.
+	if err := r.Status().Update(ctx, job); err != nil && !apierrors.IsConflict(err) {
+		return err
+	}
+	return nil
 }
 
 func equalStatus(a, b *computev1alpha1.SparkJobStatus) bool {
@@ -390,14 +393,22 @@ func sparkSubmitScript(job *computev1alpha1.SparkJob, podName, driverHost string
 		confs["spark.kubernetes.authenticate.driver.serviceAccountName"] = job.Name + "-driver-sa"
 	}
 	if req, ok := job.Spec.ExecutorResources.Requests[corev1.ResourceCPU]; ok {
-		confs["spark.executor.cores"] = req.String()
+		// Spark expects a whole-integer core count (>=1). K8s CPU may be
+		// fractional ("250m"); round millicores up to the nearest whole core.
+		cores := max((req.MilliValue()+999)/1000, 1)
+		confs["spark.executor.cores"] = strconv.FormatInt(cores, 10)
 	}
 	if req, ok := job.Spec.ExecutorResources.Requests[corev1.ResourceMemory]; ok {
 		confs["spark.executor.memory"] = humanMem(req)
 	}
-	for k, v := range job.Spec.SparkConf {
-		confs[k] = v
+	if req, ok := job.Spec.DriverResources.Requests[corev1.ResourceCPU]; ok {
+		cores := max((req.MilliValue()+999)/1000, 1)
+		confs["spark.driver.cores"] = strconv.FormatInt(cores, 10)
 	}
+	if req, ok := job.Spec.DriverResources.Requests[corev1.ResourceMemory]; ok {
+		confs["spark.driver.memory"] = humanMem(req)
+	}
+	maps.Copy(confs, job.Spec.SparkConf)
 
 	// Deterministic --conf ordering for cache-friendly pod specs.
 	keys := make([]string, 0, len(confs))
