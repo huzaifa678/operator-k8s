@@ -12,6 +12,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"sort"
@@ -19,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/robfig/cron/v3"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -49,6 +51,22 @@ const (
 	driverPort       = 7078
 	blockManagerPort = 7079
 	defaultSparkImg  = "apache/spark:3.5.3"
+
+	// Scheduled-mode labels: set on every child run so the template can find
+	// its descendants without a controller-ref List walk.
+	parentLabel    = "compute.compute.example.com/sparkjob-parent"
+	runAtLabel     = "compute.compute.example.com/run-at" // unix seconds
+	scheduledLabel = "compute.compute.example.com/scheduled"
+
+	concurrencyAllow   = "Allow"
+	concurrencyForbid  = "Forbid"
+	concurrencyReplace = "Replace"
+)
+
+// cronParser accepts the standard 5-field form ("min hour dom mon dow"), the
+// same dialect Kubernetes' batch/v1 CronJob uses.
+var cronParser = cron.NewParser(
+	cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow,
 )
 
 type SparkJobReconciler struct {
@@ -65,6 +83,7 @@ type SparkJobReconciler struct {
 // +kubebuilder:rbac:groups="",resources=serviceaccounts,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles;rolebindings,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
 
 func (r *SparkJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (result ctrl.Result, retErr error) {
 	log := logf.FromContext(ctx)
@@ -84,6 +103,12 @@ func (r *SparkJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (r
 			metrics.DeleteSpark(req.Namespace, req.Name)
 		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	// Scheduled template? Branch into the cron-driven path; it never spawns a
+	// driver pod, only child SparkJob runs.
+	if job.Spec.Schedule != nil && *job.Spec.Schedule != "" {
+		return r.reconcileScheduled(ctx, &job)
 	}
 
 	if job.Status.Phase == computev1alpha1.PhaseSucceeded ||
@@ -107,7 +132,23 @@ func (r *SparkJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (r
 	err = r.Get(ctx, types.NamespacedName{Namespace: job.Namespace, Name: driverName}, driver)
 	switch {
 	case apierrors.IsNotFound(err):
-		driver = buildDriverPod(&job, driverName, saName, desired)
+		execEnvConf, err := r.derivedExecutorEnvConf(ctx, &job)
+		if err != nil {
+			if dep, ok := asMissingDep(err); ok {
+				// Wait politely: don't spawn the driver, mark the job Pending with
+				// a clear condition, requeue at a slow cadence. No stack trace.
+				// Log at V(1) — the status condition tells the user what they need
+				// to know via `kubectl describe`; spamming INFO every reconcile is
+				// just noise (controller-runtime can re-queue many times per sec).
+				log.V(1).Info("waiting for dependency", "kind", dep.kind, "name", dep.name)
+				if err := r.markAwaiting(ctx, &job, dep); err != nil {
+					return ctrl.Result{}, err
+				}
+				return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+			}
+			return ctrl.Result{}, fmt.Errorf("derive executor env: %w", err)
+		}
+		driver = buildDriverPod(&job, driverName, saName, desired, execEnvConf)
 		if err := controllerutil.SetControllerReference(&job, driver, r.Scheme); err != nil {
 			return ctrl.Result{}, err
 		}
@@ -350,7 +391,7 @@ func estimateCost(start, end *metav1.Time, podCount int32, costPerHour string) s
 	return fmt.Sprintf("%.4f", hours*rate*float64(podCount))
 }
 
-func buildDriverPod(job *computev1alpha1.SparkJob, name, sa string, executors int32) *corev1.Pod {
+func buildDriverPod(job *computev1alpha1.SparkJob, name, sa string, executors int32, execEnvConf map[string]string) *corev1.Pod {
 	image := job.Spec.Image
 	if image == "" {
 		image = defaultSparkImg
@@ -377,18 +418,21 @@ func buildDriverPod(job *computev1alpha1.SparkJob, name, sa string, executors in
 				Name:      "spark-submit",
 				Image:     image,
 				Command:   []string{"/bin/sh", "-c"},
-				Args:      []string{sparkSubmitScript(job, name, driverHost, executors, image)},
+				Args:      []string{sparkSubmitScript(job, name, driverHost, executors, image, execEnvConf)},
 				Resources: driverResources(job),
 				Ports: []corev1.ContainerPort{
 					{Name: "driver-rpc", ContainerPort: driverPort},
 					{Name: "blockmgr", ContainerPort: blockManagerPort},
 				},
-				Env: []corev1.EnvVar{
+				// Built-ins first so user-supplied Env can override if they really want to
+				// (e.g. force a specific POD_NAME for debugging).
+				Env: append([]corev1.EnvVar{
 					{Name: "SPARK_DRIVER_BIND_ADDRESS", ValueFrom: &corev1.EnvVarSource{
 						FieldRef: &corev1.ObjectFieldSelector{FieldPath: "status.podIP"}}},
 					{Name: "POD_NAME", ValueFrom: &corev1.EnvVarSource{
 						FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.name"}}},
-				},
+				}, job.Spec.Env...),
+				EnvFrom: job.Spec.EnvFrom,
 			}},
 		},
 	}
@@ -398,7 +442,11 @@ func buildDriverPod(job *computev1alpha1.SparkJob, name, sa string, executors in
 // sparkSubmitScript assembles a real spark-submit invocation using Spark's
 // native Kubernetes scheduler backend in client mode. The driver pod is the
 // spark-submit process; Spark spawns executors itself via the k8s API.
-func sparkSubmitScript(job *computev1alpha1.SparkJob, podName, driverHost string, executors int32, image string) string {
+//
+// execEnvConf carries spark.kubernetes.executor.{secret,configMap}KeyRef.*
+// entries derived from spec.envFrom / spec.env so executors get the same
+// env as the driver without the user repeating themselves in sparkConf.
+func sparkSubmitScript(job *computev1alpha1.SparkJob, podName, driverHost string, executors int32, image string, execEnvConf map[string]string) string {
 	confs := map[string]string{
 		"spark.kubernetes.namespace":                              job.Namespace,
 		"spark.kubernetes.driver.pod.name":                        podName,
@@ -431,6 +479,8 @@ func sparkSubmitScript(job *computev1alpha1.SparkJob, podName, driverHost string
 	if req, ok := job.Spec.DriverResources.Requests[corev1.ResourceMemory]; ok {
 		confs["spark.driver.memory"] = humanMem(req)
 	}
+	// Derived first, then user SparkConf — so explicit user values win.
+	maps.Copy(confs, execEnvConf)
 	maps.Copy(confs, job.Spec.SparkConf)
 
 	// Deterministic --conf ordering for cache-friendly pod specs.
@@ -520,9 +570,126 @@ func (r *SparkJobReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.ServiceAccount{}).
 		Owns(&rbacv1.Role{}).
 		Owns(&rbacv1.RoleBinding{}).
+		// Owning child SparkJobs lets a scheduled template wake up when one of
+		// its children finishes (for prune / Active list refresh).
+		Owns(&computev1alpha1.SparkJob{}).
 		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(mapPodToOwner)).
 		Named("sparkjob").
 		Complete(r)
+}
+
+// missingDepError signals that a referenced Secret / ConfigMap doesn't exist yet.
+// Reconcile treats this as "wait politely" rather than an error: no stack trace,
+// no retry storm — just a clear status condition + slow requeue.
+type missingDepError struct{ kind, name string }
+
+func (e *missingDepError) Error() string {
+	return fmt.Sprintf("%s %q not found", e.kind, e.name)
+}
+
+func asMissingDep(err error) (*missingDepError, bool) {
+	var m *missingDepError
+	if err != nil && errors.As(err, &m) {
+		return m, true
+	}
+	return nil, false
+}
+
+// markAwaiting sets Phase=Pending and a DependenciesReady=False condition with
+// a human-readable message naming the missing object. Idempotent: status is
+// only written when something changed.
+func (r *SparkJobReconciler) markAwaiting(ctx context.Context, job *computev1alpha1.SparkJob, dep *missingDepError) error {
+	wantMsg := fmt.Sprintf("waiting for %s %q", dep.kind, dep.name)
+	cond := metav1.Condition{
+		Type:               "DependenciesReady",
+		Status:             metav1.ConditionFalse,
+		Reason:             "AwaitingDependency",
+		Message:            wantMsg,
+		LastTransitionTime: metav1.Now(),
+		ObservedGeneration: job.Generation,
+	}
+
+	// Find an existing matching condition; bail if nothing changed so we don't
+	// thrash status updates every 30s.
+	for i := range job.Status.Conditions {
+		c := &job.Status.Conditions[i]
+		if c.Type == cond.Type {
+			if c.Status == cond.Status && c.Reason == cond.Reason && c.Message == cond.Message &&
+				job.Status.Phase == computev1alpha1.PhasePending {
+				return nil
+			}
+			job.Status.Conditions[i] = cond
+			job.Status.Phase = computev1alpha1.PhasePending
+			return r.Status().Update(ctx, job)
+		}
+	}
+	job.Status.Conditions = append(job.Status.Conditions, cond)
+	job.Status.Phase = computev1alpha1.PhasePending
+	return r.Status().Update(ctx, job)
+}
+
+// derivedExecutorEnvConf turns the driver's Env / EnvFrom into Spark confs
+// so executor pods (which Spark creates, not us) inherit the same env.
+//
+// For Env entries with valueFrom.{Secret,ConfigMap}KeyRef we already have all
+// the info. For EnvFrom (bulk Secret/ConfigMap), we fetch the referenced
+// object to enumerate its keys — otherwise Spark wouldn't know what env vars
+// to project.
+//
+// Returns a *missingDepError when a non-optional ref doesn't exist; the caller
+// is expected to surface that as a status condition and requeue, not crash.
+func (r *SparkJobReconciler) derivedExecutorEnvConf(ctx context.Context, job *computev1alpha1.SparkJob) (map[string]string, error) {
+	out := map[string]string{}
+
+	for _, e := range job.Spec.Env {
+		if e.ValueFrom == nil {
+			continue
+		}
+		switch {
+		case e.ValueFrom.SecretKeyRef != nil:
+			ref := e.ValueFrom.SecretKeyRef
+			out["spark.kubernetes.executor.secretKeyRef."+e.Name] = ref.Name + ":" + ref.Key
+		case e.ValueFrom.ConfigMapKeyRef != nil:
+			ref := e.ValueFrom.ConfigMapKeyRef
+			out["spark.kubernetes.executor.configMapKeyRef."+e.Name] = ref.Name + ":" + ref.Key
+		}
+	}
+
+	for _, ef := range job.Spec.EnvFrom {
+		switch {
+		case ef.SecretRef != nil:
+			var sec corev1.Secret
+			err := r.Get(ctx, types.NamespacedName{Namespace: job.Namespace, Name: ef.SecretRef.Name}, &sec)
+			if err != nil {
+				if apierrors.IsNotFound(err) {
+					if ef.SecretRef.Optional != nil && *ef.SecretRef.Optional {
+						continue
+					}
+					return nil, &missingDepError{kind: "Secret", name: ef.SecretRef.Name}
+				}
+				return nil, fmt.Errorf("envFrom secret %q: %w", ef.SecretRef.Name, err)
+			}
+			for k := range sec.Data {
+				out["spark.kubernetes.executor.secretKeyRef."+ef.Prefix+k] = ef.SecretRef.Name + ":" + k
+			}
+		case ef.ConfigMapRef != nil:
+			var cm corev1.ConfigMap
+			err := r.Get(ctx, types.NamespacedName{Namespace: job.Namespace, Name: ef.ConfigMapRef.Name}, &cm)
+			if err != nil {
+				if apierrors.IsNotFound(err) {
+					if ef.ConfigMapRef.Optional != nil && *ef.ConfigMapRef.Optional {
+						continue
+					}
+					return nil, &missingDepError{kind: "ConfigMap", name: ef.ConfigMapRef.Name}
+				}
+				return nil, fmt.Errorf("envFrom configMap %q: %w", ef.ConfigMapRef.Name, err)
+			}
+			for k := range cm.Data {
+				out["spark.kubernetes.executor.configMapKeyRef."+ef.Prefix+k] = ef.ConfigMapRef.Name + ":" + k
+			}
+		}
+	}
+	return out, nil
 }
 
 func mapPodToOwner(_ context.Context, obj client.Object) []ctrl.Request {

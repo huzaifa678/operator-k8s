@@ -1,24 +1,24 @@
 apiVersion: compute.compute.example.com/v1alpha1
 kind: TrainingRun
 metadata:
-  name: bert-tiny-ddp
+  name: bert-finetune-articles
+  labels:
+    pipeline: articles
+    stage: train
 spec:
   framework: PyTorch
-  # pytorch/pytorch ships torch + CUDA; runs on CPU too (we use gloo backend).
-  # Image is ~5GB — pre-pull with: docker pull pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
-  # then: k3d image import pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime -c compute-op
-  # it is feasible on GPU access a side note to be aware of
   image: pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
   worldSize: 2
   workerResources:
-    requests:
-      cpu: "500m"
-      memory: "2Gi"
-    limits:
-      memory: "4Gi"
-  # transformers pulls the BERT model + tokenizer from HF Hub on first run.
+    requests: { cpu: "500m", memory: "2Gi" }
+    limits:   { memory: "4Gi" }
   packages:
     - transformers==4.44.2
+    - pandas==2.2.2
+    - pyarrow==17.0.0       # required for the built-in BERT trainer's Parquet read
+  # Mount the PVC where elt-orders-pipeline wrote its Parquet output.
+  # The controller mounts it read-only at /data.
+  datasetPVC: articles-processed-pvc
   resourceHint:
     costPerHourUSD: "0.20"
   spot:
@@ -26,116 +26,16 @@ spec:
     maxRetries: 2
   checkpoint:
     enabled: false
+  # Controller-supplied training script — see Go: bertClassifierScript.
+  # Defaults to distilbert-base-uncased on CPU, ModernBERT-base on GPU.
+  builtinTrainer: BERTClassifier
   env:
-    - { name: PYTHONUNBUFFERED, value: "1" }
-    - { name: TRANSFORMERS_VERBOSITY, value: "error" }
-    # Force gloo (CPU collective backend) since k3d has no GPUs.
+    - { name: PYTHONUNBUFFERED,             value: "1" }
+    - { name: TRANSFORMERS_VERBOSITY,       value: "error" }
     - { name: TORCH_DISTRIBUTED_DEFAULT_BACKEND, value: "gloo" }
-  script: |
-    """Toy distributed fine-tune of bert-tiny on a hard-coded 2-class dataset.
-    Demonstrates the controller's torchrun + headless-svc + ranked DNS plumbing
-    end to end on CPU.
-
-    ─── TWEAK POINTS ─────────────────────────────────────────────────────────
-    Everything below is intentionally minimal. Adapt to your workload:
-
-      MODEL          Swap to any HuggingFace causal-LM, seq-classification,
-                     or seq-to-seq checkpoint. e.g. "bert-base-uncased",
-                     "distilbert-base-uncased", "google/flan-t5-small".
-                     Bigger models need more memory in workerResources.
-
-      NUM_LABELS     Match your task. 2 for binary sentiment, N for N-class.
-
-      EPOCHS / LR    Bumped down to fit the toy dataset; raise for real data.
-
-      ToyDataset     Replace SAMPLES with a torch.utils.data.Dataset that
-                     reads your real corpus (from /data if you mounted a
-                     datasetPVC, or from S3/GCS via fsspec). The DDP +
-                     DistributedSampler scaffolding stays unchanged.
-
-      Model head     AutoModelForSequenceClassification works for classification.
-                     Use AutoModelForCausalLM, AutoModelForSeq2SeqLM, etc.
-                     for other tasks — the rest of the loop is task-agnostic.
-
-      Optimizer      AdamW is the default; swap for Lion, AdaFactor, or
-                     bitsandbytes 8-bit Adam to fit larger models on the
-                     same hardware.
-
-      Checkpointing  Add torch.save(model.state_dict(), "/data/ckpt.pt")
-                     once per epoch on rank 0. The controller's
-                     spec.checkpoint.s3URI will eventually wire this up.
-
-      Logging        print() goes to kubectl logs. For W&B / MLflow, add
-                     `wandb` to spec.packages and call wandb.init() on rank 0.
-    ──────────────────────────────────────────────────────────────────────────
-    """
-    import os
-    import torch
-    import torch.distributed as dist
-    from torch.nn.parallel import DistributedDataParallel as DDP
-    from torch.optim import AdamW
-    from torch.utils.data import DataLoader, Dataset, DistributedSampler
-    from transformers import AutoModelForSequenceClassification, AutoTokenizer
-
-    # ─── tweak: model + task config ───────────────────────────────────────
-    MODEL       = "prajjwal1/bert-tiny"   # ~17 MB. Try "distilbert-base-uncased" (~250 MB).
-    NUM_LABELS  = 2                       # 2-class. Change for multi-class.
-    MAX_LENGTH  = 32                      # tokenizer truncation. Raise for longer text.
-    BATCH_SIZE  = 2                       # per-rank batch. Effective = BATCH_SIZE * world_size.
-    EPOCHS      = 3
-    LEARNING_RATE = 5e-5
-
-    # ─── tweak: replace with your own Dataset ─────────────────────────────
-    # Read from /data (mount via spec.datasetPVC) or stream from S3.
-    class ToyDataset(Dataset):
-        SAMPLES = [
-            ("the movie was wonderful and uplifting", 1),
-            ("absolutely loved the cinematography",   1),
-            ("a complete waste of two hours",         0),
-            ("boring and predictable from start",     0),
-        ]
-        def __init__(self, tok):
-            self.enc = [tok(s, padding="max_length", truncation=True,
-                            max_length=MAX_LENGTH, return_tensors="pt")
-                        for s, _ in self.SAMPLES]
-            self.lab = torch.tensor([l for _, l in self.SAMPLES])
-        def __len__(self):  return len(self.SAMPLES)
-        def __getitem__(self, i):
-            e = self.enc[i]
-            return e["input_ids"].squeeze(0), e["attention_mask"].squeeze(0), self.lab[i]
-
-    def main():
-        rank       = int(os.environ["RANK"])
-        world_size = int(os.environ["WORLD_SIZE"])
-        backend    = os.environ.get("TORCH_DISTRIBUTED_DEFAULT_BACKEND", "gloo")
-
-        dist.init_process_group(backend=backend)
-        print(f"[rank {rank}/{world_size}] handshake OK on backend={backend}", flush=True)
-
-        tok   = AutoTokenizer.from_pretrained(MODEL)
-        # ─── tweak: pick the model head that matches your task ───────────
-        # AutoModelForSequenceClassification / CausalLM / Seq2SeqLM / TokenClassification …
-        model = AutoModelForSequenceClassification.from_pretrained(MODEL, num_labels=NUM_LABELS)
-        model = DDP(model)
-
-        ds      = ToyDataset(tok)
-        sampler = DistributedSampler(ds, num_replicas=world_size, rank=rank, shuffle=True)
-        loader  = DataLoader(ds, batch_size=BATCH_SIZE, sampler=sampler)
-        # ─── tweak: swap optimizer if scaling to a bigger model ──────────
-        optim   = AdamW(model.parameters(), lr=LEARNING_RATE)
-
-        for epoch in range(EPOCHS):
-            sampler.set_epoch(epoch)
-            for ids, mask, lab in loader:
-                optim.zero_grad()
-                out = model(input_ids=ids, attention_mask=mask, labels=lab)
-                out.loss.backward()
-                optim.step()
-                print(f"[rank {rank}] epoch={epoch} loss={out.loss.item():.4f}", flush=True)
-
-        if rank == 0:
-            print("[rank 0] training complete", flush=True)
-        dist.destroy_process_group()
-
-    if __name__ == "__main__":
-        main()
+    # Built-in trainer hyperparams (all optional; defaults in builtin_trainer_bert.go).
+    - { name: TEXT_COLUMN,        value: "title" }
+    - { name: LABEL_COLUMN,       value: "source" }
+    - { name: DATA_PARQUET_GLOB,  value: "/data/published_date=*/*.parquet" }
+    # Override the auto-selected model if you want; otherwise omit.
+    # - { name: BERT_MODEL,       value: "distilbert-base-uncased" }

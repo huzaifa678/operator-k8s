@@ -19,6 +19,20 @@ Two CRDs (`SparkJob`, `TrainingRun`) share one controller binary and a common se
 
 ---
 
+## What's new in this revision
+
+- **Schema pivoted from "orders" to "articles".** The pipeline now scrapes real public sources (HN RSS, Reddit RSS, OWID CSV) into the schema `id, source, title, link, published_at, summary, category`. ELT casts dates, strips HTML, partitions by `published_date`.
+- **CR names renamed**: `scrape-orders-raw` → `scrape-articles-raw`, `elt-orders-pipeline` → `elt-articles-pipeline`, `bert-finetune-orders[-gpu]` → `bert-finetune-articles[-gpu]`. PVC is `articles-processed-pvc`. File paths in S3 are `raw/articles/`, `processed/articles/`.
+- **Native cron on `SparkJob`.** New `spec.schedule` (5-field cron), plus `suspend`, `timeZone`, `concurrencyPolicy` (Allow/Forbid/Replace), `startingDeadlineSeconds`, `successfulJobsHistoryLimit`, `failedJobsHistoryLimit`. When set, the SparkJob is a *template* — the controller spawns child runs at each fire time. See [The CRDs § SparkJob](#sparkjob).
+- **Secret/ConfigMap projection on `SparkJob`.** New `spec.env` and `spec.envFrom` (standard `corev1` shapes). The controller auto-derives `spark.kubernetes.executor.{secret,configMap}KeyRef.*` so executors inherit the same env without restating it in `sparkConf`. Used for AWS credentials via an `aws-creds` Secret.
+- **Built-in trainer on `TrainingRun`.** New `spec.builtinTrainer: BERTClassifier` — controller injects a Parquet-reading DDP BERT classifier (DistilBERT on CPU, ModernBERT on GPU, auto-detect). No more 100-line Python pasted into YAML.
+- **Custom Spark image** with `hadoop-aws` + `aws-java-sdk-bundle` baked in (`compute-operator/spark-s3:3.5.3`). Build with `make spark-image-k3d`.
+- **`make upload-jobs`** pushes `jobs/*.py` + `scrape_urls.json` to S3 at the layout the SparkJob CRs reference. Resumable; no path-typo surprises.
+- **Polite waiting for dependencies.** Missing referenced Secret/ConfigMap → SparkJob goes `Pending` with a `DependenciesReady=False` condition message naming the missing object. No more reconcile error storms.
+- **Prometheus scrapes the laptop.** [`config/prometheus/laptop_target.yaml`](config/prometheus/laptop_target.yaml) lets the in-cluster Prometheus (kube-prometheus-stack) scrape `make run`'s `/metrics` over the docker bridge — no in-cluster controller required. `make run` / `make run-with-webhooks` now expose plain HTTP on `:8080`.
+
+---
+
 ## Architecture at a glance
 
 ### Codegen pipeline — Go types are the source of truth
@@ -46,50 +60,79 @@ flowchart LR
     style G fill:#fff3e0,stroke:#f57c00
 ```
 
-### Runtime — what happens when you `kubectl apply` a CR
+### Runtime — what happens when you `kubectl apply` the pipeline
 
 ```mermaid
 sequenceDiagram
     autonumber
     actor User
-    participant API as K8s API server
-    participant Ctrl as compute-operator<br/>(controller-runtime mgr)
-    participant Spark as Spark driver pod<br/>(spark-submit)
+    participant API   as K8s API server
+    participant Ctrl  as compute-operator<br/>(controller-runtime mgr)
+    participant S1drv as scrape-articles-raw<br/>driver pod
+    participant S2drv as elt-articles-pipeline<br/>driver pod
     participant Execs as Executor pods<br/>(spawned by Spark)
+    participant TR    as bert-finetune-articles<br/>worker pods (rank 0…N)
 
-    User->>API: kubectl apply -f sparkjob.yaml
+    User->>API: kubectl apply scrape SparkJob
     API-->>Ctrl: watch event: SparkJob created
     Ctrl->>Ctrl: desiredExecutorCount(spec)<br/>auto-tune from inputSizeMB
-
-    Ctrl->>API: create ServiceAccount + Role + RoleBinding
-    Ctrl->>API: create headless Service (driver-svc)
-    Ctrl->>API: create driver Pod (image=apache/spark)
-    Ctrl->>API: SetOwnerReferences(CR -> children)
-
-    API-->>Spark: scheduled
-    Spark->>Spark: /opt/spark/bin/spark-submit<br/>--master k8s:// --deploy-mode client
-    Spark->>API: create executor pods<br/>(via K8s scheduler backend)
+    Ctrl->>API: create SA + Role + RoleBinding + headless Svc
+    Ctrl->>API: create driver Pod (scrape-articles-raw-driver)
+    API-->>S1drv: scheduled
+    S1drv->>S1drv: spark-submit scrape_articles.py<br/>fetches CSV+XML feeds in parallel
+    S1drv->>API: create executor pods (K8s scheduler backend)
     API-->>Execs: scheduled
-    Execs-->>Spark: register via driver-svc DNS
+    Execs-->>S1drv: register via driver-svc DNS
+    S1drv-->>API: pod Succeeded — normalised CSV written to S3 (raw/articles/YYYY/MM/DD/)
 
-    loop every 15s + on pod events
-        API-->>Ctrl: watch event: pod phase changed
-        Ctrl->>API: GET SparkJob (latest)
-        Ctrl->>API: PATCH CR.status<br/>(phase, runningExecutors,<br/>estimatedCostUSD)
+    loop every 15s + pod events (Stage 1)
+        API-->>Ctrl: pod phase changed
+        Ctrl->>API: PATCH scrape-articles-raw.status<br/>(phase, executors, cost)
     end
 
-    Spark-->>API: pod Succeeded (Pi = 3.14...)
+    User->>API: kubectl apply ELT SparkJob
+    API-->>Ctrl: watch event: SparkJob created
+    Ctrl->>API: create driver Pod (elt-articles-pipeline-driver)
+    API-->>S2drv: scheduled
+    S2drv->>S2drv: spark-submit elt_articles.py<br/>clean/cast → Parquet on PVC
+    S2drv->>API: create executor pods
+    API-->>Execs: scheduled
+    S2drv-->>API: pod Succeeded — Parquet written to articles-processed-pvc
+
+    loop every 15s + pod events (Stage 2)
+        API-->>Ctrl: pod phase changed
+        Ctrl->>API: PATCH elt-articles-pipeline.status
+    end
+
+    User->>API: kubectl apply TrainingRun
+    API-->>Ctrl: watch event: TrainingRun created
+    Ctrl->>API: create headless Svc + script ConfigMap
+    Ctrl->>API: create worker pods rank-0…rank-N<br/>(mounts articles-processed-pvc at /data)
+    API-->>TR: scheduled
+    TR->>TR: pip install transformers pandas pyarrow
+    TR->>TR: torchrun bertClassifier built-in<br/>reads Parquet from /data<br/>saves model + label_to_id.json to /data/model
+
+    loop every 15s + pod events (Stage 3)
+        API-->>Ctrl: pod phase changed
+        Ctrl->>API: PATCH bert-finetune-articles.status<br/>(phase, readyWorkers, cost)
+    end
+
+    TR-->>API: all workers Succeeded
     API-->>Ctrl: watch event
-    Ctrl->>API: PATCH CR.status.phase=Succeeded
+    Ctrl->>API: PATCH TrainingRun.status.phase=Succeeded
 ```
 
 ### Two CRDs, one controller binary, shared subsystems
 
 ```mermaid
 flowchart TB
-    subgraph User_intent["User intent"]
-        SJ[SparkJob CR]
-        TR[TrainingRun CR]
+    subgraph User_intent["User intent — 3-stage articles pipeline"]
+        direction LR
+        SJ1[SparkJob<br/>scrape-articles-raw]
+        SJ2[SparkJob<br/>elt-articles-pipeline]
+        TR[TrainingRun<br/>bert-finetune-articles]
+        SJ1 -- S3 CSV --> SJ2
+        SJ2 -- Parquet PVC --> TR
     end
 
     subgraph Controller["compute-operator binary"]
@@ -98,28 +141,37 @@ flowchart TB
         SHARED[Shared:<br/>spotAffinity / desiredExecutorCount<br/>estimateCost / mapPodToOwner]
     end
 
-    subgraph Cluster_resources["Cluster resources controller produces"]
+    subgraph Spark_resources["SparkJob resources"]
         direction LR
-        SDRV[Driver Pod<br/>+ SA/Role/RB<br/>+ headless Svc]
+        SDRV1[scrape driver Pod<br/>+ SA/Role/RB + Svc]
+        SDRV2[elt driver Pod<br/>+ SA/Role/RB + Svc]
         SEXE[Executor Pods<br/><sub>spawned by Spark itself</sub>]
-        TWRK[Worker Pods<br/>rank-0…rank-N<br/>+ headless Svc<br/>+ Script ConfigMap]
     end
 
-    SJ --> SR
-    TR --> TRR
-    SR -.-> SHARED
+    subgraph Training_resources["TrainingRun resources"]
+        TWRK[Worker Pods rank-0…N<br/>+ headless Svc<br/>+ Script ConfigMap<br/>mounts articles-processed-pvc]
+    end
+
+    SJ1 --> SR
+    SJ2 --> SR
+    TR  --> TRR
+    SR  -.-> SHARED
     TRR -.-> SHARED
 
-    SR --> SDRV
-    SDRV -. spark-submit creates .-> SEXE
+    SR  --> SDRV1
+    SR  --> SDRV2
+    SDRV1 -. spark-submit creates .-> SEXE
+    SDRV2 -. spark-submit creates .-> SEXE
     TRR --> TWRK
 
-    style SJ fill:#e1f5ff,stroke:#0288d1
-    style TR fill:#e1f5ff,stroke:#0288d1
+    style SJ1  fill:#e1f5ff,stroke:#0288d1
+    style SJ2  fill:#e1f5ff,stroke:#0288d1
+    style TR   fill:#e1f5ff,stroke:#0288d1
     style SHARED fill:#f3e5f5,stroke:#7b1fa2
-    style SDRV fill:#c8e6c9,stroke:#388e3c
-    style SEXE fill:#c8e6c9,stroke:#388e3c,stroke-dasharray: 5 5
-    style TWRK fill:#c8e6c9,stroke:#388e3c
+    style SDRV1 fill:#c8e6c9,stroke:#388e3c
+    style SDRV2 fill:#c8e6c9,stroke:#388e3c
+    style SEXE  fill:#c8e6c9,stroke:#388e3c,stroke-dasharray: 5 5
+    style TWRK  fill:#c8e6c9,stroke:#388e3c
 ```
 
 ### What each reconciler does on every pass
@@ -166,8 +218,9 @@ flowchart TD
 | `internal/metrics/` | Custom Prometheus metrics + helpers |
 | `cmd/main.go` | Manager entrypoint (registers both controllers + webhooks) |
 | `config/` | Kustomize manifests (CRDs, RBAC, Deployment, samples) |
-| `config/samples/` | Working `SparkJob` and `TrainingRun` CRs |
+| `config/samples/` | Working `SparkJob` and `TrainingRun` CRs (3-stage pipeline) |
 | `dist/chart/` | Generated Helm chart (mirror of `config/`) |
+| `jobs/` | PySpark + Python scripts: `scrape_articless.py`, `elt_articles.py`, `scrape_urls.json` |
 | `scripts/install-nvidia-drivers.sh` | Host-level driver install for GPU nodes |
 | `Makefile` | Build, test, lint, deploy, GPU stack targets |
 
@@ -182,31 +235,90 @@ kubectl config use-context k3d-compute-op
 
 # 2. Install CRDs + run the controller locally
 make install
-make run                                  # foreground; blocks. Open a new terminal for step 3.
-
-# 3. Apply the SparkPi sample
-kubectl apply -f config/samples/compute_v1alpha1_sparkjob.yaml
-
-# 4. Watch it
-kubectl get sparkjob -w
-kubectl get pods -l compute.compute.example.com/sparkjob=sparkpi-sample
-kubectl logs sparkpi-sample-driver -f    # look for "Pi is roughly 3.14..."
+make run                  # foreground; blocks. Open a new terminal for the steps below.
 ```
 
-A successful run produces a driver pod (`sparkpi-sample-driver`) + 2 executor pods (`spark-pi-…-exec-1/2`) spawned by Spark itself via the K8s scheduler backend, then all three reach `Completed`.
+### The 3-stage articles pipeline
 
-### BERT-tiny TrainingRun (CPU, gloo backend)
+The samples ship a complete end-to-end pipeline scraping real public sources (Hacker News RSS, Reddit RSS, OWID CSV). Each stage is a separate custom resource; run them in order:
+
+```
+Stage 1 ─ scrape-articles-raw     (SparkJob)    distributed HTTP scraper: RSS/XML + CSV feeds → S3 landing zone
+Stage 2 ─ elt-articles-pipeline   (SparkJob)    clean/cast/partition → Parquet on PVC
+Stage 3 ─ bert-finetune-articles  (TrainingRun) DistilBERT/ModernBERT fine-tune via the controller-supplied script
+```
+
+#### Prerequisites (one-time per cluster)
 
 ```bash
-# Pre-pull the heavy pytorch image once (saves an in-cluster pull):
+# 1. Custom Spark image with hadoop-aws + aws-java-sdk-bundle baked in
+make spark-image-k3d                # downloads jars to cluster/spark/jars/, builds, imports
+
+# 2. AWS credentials for the Spark drivers (envFrom-injected)
+kubectl -n default create secret generic aws-creds \
+  --from-literal=AWS_ACCESS_KEY_ID=AKIA... \
+  --from-literal=AWS_SECRET_ACCESS_KEY=...
+
+# 3. Push Python jobs + scrape_urls.json to S3 (the path the SparkJob CRs reference)
+make upload-jobs S3_BUCKET=spark-lake-2998043
+```
+
+#### Run the pipeline
+
+```bash
+# Apply everything (samples include the articles-processed-pvc PVC):
+kubectl apply -k config/samples
+# Or apply individually in order:
+# kubectl apply -f config/samples/articles_processed_pvc.yaml
+# kubectl apply -f config/samples/compute_v1alpha1_sparkjob_scrape.yaml
+# kubectl apply -f config/samples/compute_v1alpha1_sparkjob.yaml
+# kubectl apply -f config/samples/compute_v1alpha1_trainingrun.yaml
+
+# Stage 1 — scrape RSS + CSV into S3
+kubectl get sparkjob scrape-articles-raw -w
+kubectl logs scrape-articles-raw-driver -f      # [scrape] total rows scraped: N
+
+# Stage 2 — ELT: clean → Parquet, partitioned by published_date
+kubectl get sparkjob elt-articles-pipeline -w
+kubectl logs elt-articles-pipeline-driver -f    # [load] rows written (good): N
+
+# Stage 3 — BERT fine-tune (CPU, gloo). Pre-pull the pytorch image (~5 GB) first:
 docker pull pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
 k3d image import pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime -c compute-op
 
-kubectl apply -f config/samples/compute_v1alpha1_trainingrun.yaml
-kubectl logs bert-tiny-ddp-rank-0 -f
+kubectl logs bert-finetune-articles-rank-0 -f
+# [rank 0/2] model=distilbert-base-uncased backend=gloo device=cpu
+# [data] 60 rows | 4 classes | text=title label=source
+# [rank 0] epoch=0 avg_loss=1.32 ...
+# [rank 0] model + label map saved to /data/model
 ```
 
-Expect: `pip install transformers` → `[rank 0/2] handshake OK on backend=gloo` → loss prints over 3 epochs → `[rank 0] training complete`.
+#### How the stages connect
+
+```
+jobs/scrape_urls.json   (HN frontpage, HN best, Reddit r/programming, OWID CO2 CSV)
+      │
+      ▼
+scrape-articles-raw ──writes──► s3://.../raw/articles/YYYY/MM/DD/   (CSV, partitioned by source)
+                                          │
+                                          ▼
+                          elt-articles-pipeline ──writes──► s3://.../processed/articles/    (Parquet)
+                                                                       │
+                                                                       ▼   (via articles-processed-pvc)
+                                                       bert-finetune-articles
+                                                       reads /data/published_date=*/*.parquet
+                                                       saves /data/model/ + label_to_id.json
+```
+
+- **No inline Python in YAML.** The trainer script lives in Go ([builtin_trainer_bert.go](internal/controller/builtin_trainer_bert.go)) and is materialized as a ConfigMap when `spec.builtinTrainer: BERTClassifier` is set.
+- **Env-tunable hyperparams.** `TEXT_COLUMN`, `LABEL_COLUMN`, `NUM_LABELS`, `BERT_MODEL`, `DATA_PARQUET_GLOB`, `EPOCHS`, `BATCH_SIZE`, `MAX_LENGTH`, `LR` — swap any without rebuilding the controller.
+- **The scraper does both RSS (XML) and CSV** in a single mapPartitions pass; the ELT job normalises both into a unified schema.
+
+#### Pipeline PVC
+
+The ELT job writes Parquet to `articles-processed-pvc`; the TrainingRun mounts it read-only. The PVC ships in the samples as [config/samples/articles_processed_pvc.yaml](config/samples/articles_processed_pvc.yaml) and is applied automatically by `kubectl apply -k config/samples`. On k3d the default `local-path` provisioner binds it; on EKS/GKE add a `storageClassName`.
+
+On a real cluster, back this with your storage class of choice (EFS, EBS, NFS). On k3d the default `local-path` provisioner works for single-node testing.
 
 ---
 
@@ -290,7 +402,7 @@ kubectl describe node gpu-node-1 | grep -A2 'nvidia.com/gpu'
 make install                                          # CRDs
 make deploy IMG=ghcr.io/<you>/compute-operator:v0.1.0 # controller in-cluster
 kubectl apply -f config/samples/compute_v1alpha1_trainingrun_gpu.yaml
-kubectl logs bert-tiny-ddp-gpu-rank-0 -f
+kubectl logs bert-finetune-articles-gpu-rank-0 -f
 ```
 
 What the controller emits for a CR with `spec.gpu.enabled=true, perWorker=1, runtimeClass=nvidia, backend=nccl`:
@@ -361,11 +473,20 @@ You can apply `compute_v1alpha1_trainingrun_gpu.yaml` on k3d. The CRD validation
 | `resourceHint.costPerHourUSD` | Cost-per-pod for `status.estimatedCostUSD` |
 | `driverResources`, `executorResources` | Standard K8s requests/limits |
 | `sparkConf` | Free-form `--conf key=value` pairs |
+| `env`, `envFrom` | Standard `corev1` env + Secret/ConfigMap projection on the driver. Controller auto-derives `spark.kubernetes.executor.{secret,configMap}KeyRef.*` so executors inherit the same env. |
 | `spot.{enabled,mode,maxRetries}` | Schedule on spot nodes, retry on eviction |
 | `checkpoint.{enabled,s3URI,credentialsSecret,interval}` | Future: checkpoint backend |
 | `serviceAccount` | Override the auto-created driver SA |
+| `schedule` | 5-field cron (`"min hour dom mon dow"`). When set, this CR becomes a **template** — the controller spawns child SparkJobs at each fire time instead of running directly. Mirrors `batch/v1` CronJob semantics. |
+| `suspend` | Pause scheduling without deleting the template. Existing children keep running. |
+| `timeZone` | IANA TZ for cron evaluation. Defaults to UTC. |
+| `concurrencyPolicy` | `Allow` / `Forbid` (default) / `Replace` — what to do when a fire time hits and a previous run is still active. |
+| `startingDeadlineSeconds` | Skip missed fires older than this. |
+| `successfulJobsHistoryLimit`, `failedJobsHistoryLimit` | Keep this many finished children per outcome (default 3 each). |
 
-The controller creates: ServiceAccount + Role + RoleBinding for the driver, a headless Service for `spark.driver.host`, then the driver pod running `spark-submit --master k8s://... --deploy-mode client …`. Spark itself spawns executor pods via the K8s scheduler backend.
+**One-shot mode** (default): controller creates ServiceAccount + Role + RoleBinding for the driver, a headless Service for `spark.driver.host`, then the driver pod running `spark-submit --master k8s://... --deploy-mode client …`. Spark spawns executor pods via the K8s scheduler backend.
+
+**Scheduled mode** (`spec.schedule` set): no driver pod for the template — the reconciler parses the cron expression, computes the next fire time, and creates a child `SparkJob` named `<parent>-<unix>` at each tick. Status surfaces `lastScheduleTime`, `nextScheduleTime`, and `active` (refs to in-flight children). History is pruned per the limits above. Impossible schedules (e.g. `0 0 31 2 *`) are detected and short-circuit — no infinite loops.
 
 ### `TrainingRun`
 
@@ -376,6 +497,7 @@ The controller creates: ServiceAccount + Role + RoleBinding for the driver, a he
 | `worldSize` | Number of worker pods (one is rank 0) |
 | `command`, `args`, `env` | Override the default torchrun launch |
 | `script` | Inline Python; materialized as ConfigMap, mounted at `/scripts/train.py`, run by default torchrun |
+| `builtinTrainer` | Picks a controller-supplied script instead of pasting Python into YAML. Currently: `BERTClassifier` (Parquet → DDP BERT classifier; DistilBERT on CPU, ModernBERT on GPU; env-tunable). Lives in [`internal/controller/builtin_trainer_bert.go`](internal/controller/builtin_trainer_bert.go). `script` wins if both are set. |
 | `packages` | `pip install` before launch (handy for `transformers`, etc.) |
 | `workerResources` | Standard K8s requests/limits (set `nvidia.com/gpu` for GPU) |
 | `datasetPVC` | PVC mounted read-only at `/data` |
@@ -421,6 +543,15 @@ Run `make help` for the full list. The targets you'll actually use day-to-day:
 | `make docker-push IMG=<repo>:<tag>` | Push it |
 | `make docker-buildx IMG=<repo>:<tag>` | Multi-arch buildx |
 
+### Pipeline assets
+
+| Command | What it does |
+|---------|--------------|
+| `make spark-jars` | Downloads `hadoop-aws-3.3.4.jar` + `aws-java-sdk-bundle-1.12.262.jar` into `cluster/spark/jars/` via `curl -C -` (resumable, cached). |
+| `make spark-image` | Runs `spark-jars`, then `docker build cluster/spark` to produce `compute-operator/spark-s3:3.5.3` — `apache/spark:3.5.3` with the S3A jars baked in. |
+| `make spark-image-k3d` | Builds the image and imports it into the local k3d cluster. |
+| `make upload-jobs S3_BUCKET=<name>` | Pushes `jobs/scrape_articles.py`, `jobs/elt_articles.py`, `jobs/scrape_urls.json` to `s3://<bucket>/{jobs,config}/`. Uses standard AWS SDK auth chain. |
+
 ### GPU stack (real clusters only)
 
 | Command | What it does |
@@ -438,8 +569,11 @@ Run `make help` for the full list. The targets you'll actually use day-to-day:
 |--------------|-----|
 | A field in `api/v1alpha1/*_types.go` | `make manifests generate` then `make install` (so the new CRD schema is in the cluster) then restart `make run` |
 | Controller logic in `internal/controller/*.go` | Just restart `make run` |
+| The built-in trainer script in `builtin_trainer_bert.go` | Restart `make run` and re-apply / re-create the TrainingRun (the ConfigMap is re-materialized from the new const) |
 | A `+kubebuilder:rbac:…` marker | `make manifests` (regenerates `config/rbac/role.yaml`); if running in-cluster, `make deploy IMG=…` to push new RBAC |
 | A sample CR YAML | `kubectl apply -f config/samples/<file>` (controller picks it up immediately) |
+| `jobs/scrape_articles.py` / `jobs/elt_articles.py` / `jobs/scrape_urls.json` | `make upload-jobs S3_BUCKET=…` to push to S3 — SparkJob references the S3 path, not the local file |
+| Hadoop / AWS SDK version in `cluster/spark/Dockerfile` | `make spark-image-k3d` to rebuild + re-import |
 | The Makefile / docs only | Nothing operational |
 
 ### Manual re-apply ritual (no GitOps yet)
@@ -451,9 +585,9 @@ When you change Go code while a `SparkJob` is mid-flight, the existing driver po
 lsof -nP -iTCP:8081 -sTCP:LISTEN -t | xargs kill -9
 
 # 2. Delete the stale CR + child resources (OwnerReferences cascade-delete pods/SA/RBAC/Service)
-kubectl delete sparkjob sparkpi-sample
+kubectl delete sparkjob elt-articles-pipeline
 # (or just the driver pod if the CR itself is still good)
-kubectl delete pod sparkpi-sample-driver
+kubectl delete pod elt-articles-pipeline-driver
 
 # 3. Reinstall CRDs if you changed *_types.go
 make install
@@ -461,8 +595,10 @@ make install
 # 4. Restart the controller in a fresh terminal
 make run
 
-# 5. Re-apply the sample
+# 5. Re-apply the samples in pipeline order
+kubectl apply -f config/samples/compute_v1alpha1_sparkjob_scrape.yaml
 kubectl apply -f config/samples/compute_v1alpha1_sparkjob.yaml
+kubectl apply -f config/samples/compute_v1alpha1_trainingrun.yaml
 ```
 
 **ArgoCD eliminates most of this loop** — see [`gitops/README.md`](gitops/README.md) for the full setup. TL;DR:
@@ -582,7 +718,10 @@ make prometheus-ui     # http://localhost:9090
 make grafana-ui        # http://localhost:3000  user: admin  pass: prom-operator
 ```
 
-In Prometheus UI, check `Status → Targets` — you should see `controller-manager-metrics-monitor` listed as `UP`.
+In Prometheus UI, check `Status → Targets` — you should see one of:
+
+- `controller-manager-metrics-monitor` UP → the controller is running **in-cluster** (after `make deploy`).
+- `laptop-controller-metrics` UP → the controller is running on your **laptop** via `make run` (after `make enable-metrics-monitoring`; see below).
 
 Useful PromQL to try in the **Graph** tab:
 
@@ -615,18 +754,38 @@ Grafana auto-discovers Prometheus as a datasource. You can either:
 | `compute_operator_*` metrics show up but never increment | Controller can't connect to the API server, so reconciles never run | `kubectl -n compute-operator-system logs deployment/controller-manager` |
 | Stale metrics linger after deleting a CR | Cleanup races with deletion | The reconciler calls `metrics.DeleteSpark` / `DeleteTraining` on NotFound — wait one reconcile cycle. |
 
-### Local-only smoke test (no cluster Prometheus)
+### Scraping `make run` from the in-cluster Prometheus
 
-When running `make run` locally, scrape the controller directly:
+You don't need to `make deploy` to see metrics in Prometheus. The shipped target [`config/prometheus/laptop_target.yaml`](config/prometheus/laptop_target.yaml) routes the in-cluster Prometheus to the controller running on your laptop via the docker bridge:
+
+```
+make run  →  laptop:8080/metrics (plain HTTP)
+                  ↑
+   docker bridge gateway 172.21.0.1
+                  ↑
+Prometheus pod → selectorless Service → EndpointSlice (172.21.0.1:8080) → ServiceMonitor (scheme: http)
+```
+
+Both `make run` and `make run-with-webhooks` now pass `--metrics-bind-address=:8080 --metrics-secure=false` so `/metrics` is exposed in plain HTTP. The webhook server (when enabled) keeps its own TLS port.
 
 ```bash
-# Enable metrics on a plain HTTP port for easy curl-ing
-go run ./cmd/main.go --metrics-bind-address=:8080 --metrics-secure=false
+make run                                    # exposes /metrics on :8080
+make enable-metrics-monitoring              # applies Service + EndpointSlice + ServiceMonitor
+make prometheus-ui                          # http://localhost:9090
+# Status → Targets → `laptop-controller-metrics` should be UP within ~30s
+```
 
-# In another terminal:
+If your k3d docker network gateway isn't `172.21.0.1` (check with `docker network inspect k3d-compute-op`), edit the IP in [`laptop_target.yaml`](config/prometheus/laptop_target.yaml).
+
+### Local-only smoke test (no cluster Prometheus)
+
+When you don't have kube-prometheus-stack installed at all, hit the controller directly:
+
+```bash
+make run
 curl -s localhost:8080/metrics | grep compute_operator_
 # compute_operator_sparkjob_reconciles_total{result="success"} 17
-# compute_operator_sparkjob_phase{name="sparkpi-sample",namespace="default",phase="Running"} 1
+# compute_operator_sparkjob_phase{name="elt-articles-pipeline",namespace="default",phase="Running"} 1
 # ...
 ```
 

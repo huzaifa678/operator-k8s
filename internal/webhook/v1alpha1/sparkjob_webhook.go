@@ -15,7 +15,9 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/robfig/cron/v3"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -25,6 +27,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	computev1alpha1 "github.com/huzaifa678/compute-operator/api/v1alpha1"
+)
+
+// webhookCronParser must accept the same dialect the controller uses.
+var webhookCronParser = cron.NewParser(
+	cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow,
 )
 
 var sparkjoblog = logf.Log.WithName("sparkjob-webhook")
@@ -135,6 +142,46 @@ func validateSparkJob(job *computev1alpha1.SparkJob) (admission.Warnings, error)
 		if !strings.HasPrefix(k, "spark.") {
 			warnings = append(warnings, fmt.Sprintf(
 				"spec.sparkConf[%q] does not start with \"spark.\" — Spark will likely ignore it", k))
+		}
+	}
+
+	// --- scheduled-mode fields ---
+	if job.Spec.Schedule != nil && *job.Spec.Schedule != "" {
+		if _, err := webhookCronParser.Parse(*job.Spec.Schedule); err != nil {
+			errs = append(errs, field.Invalid(specPath.Child("schedule"), *job.Spec.Schedule,
+				fmt.Sprintf("invalid cron expression (5-field, \"min hour dom mon dow\"): %v", err)))
+		}
+		switch job.Spec.ConcurrencyPolicy {
+		case "", "Allow", "Forbid", "Replace":
+		default:
+			errs = append(errs, field.NotSupported(specPath.Child("concurrencyPolicy"),
+				job.Spec.ConcurrencyPolicy, []string{"Allow", "Forbid", "Replace"}))
+		}
+		if job.Spec.StartingDeadlineSeconds != nil && *job.Spec.StartingDeadlineSeconds < 0 {
+			errs = append(errs, field.Invalid(specPath.Child("startingDeadlineSeconds"),
+				*job.Spec.StartingDeadlineSeconds, "must be >= 0"))
+		}
+		if job.Spec.SuccessfulJobsHistoryLimit != nil && *job.Spec.SuccessfulJobsHistoryLimit < 0 {
+			errs = append(errs, field.Invalid(specPath.Child("successfulJobsHistoryLimit"),
+				*job.Spec.SuccessfulJobsHistoryLimit, "must be >= 0"))
+		}
+		if job.Spec.FailedJobsHistoryLimit != nil && *job.Spec.FailedJobsHistoryLimit < 0 {
+			errs = append(errs, field.Invalid(specPath.Child("failedJobsHistoryLimit"),
+				*job.Spec.FailedJobsHistoryLimit, "must be >= 0"))
+		}
+	} else {
+		// ConcurrencyPolicy / Suspend / TimeZone without Schedule is a no-op; warn.
+		if job.Spec.ConcurrencyPolicy != "" || job.Spec.Suspend != nil ||
+			job.Spec.TimeZone != nil || job.Spec.StartingDeadlineSeconds != nil ||
+			job.Spec.SuccessfulJobsHistoryLimit != nil || job.Spec.FailedJobsHistoryLimit != nil {
+			warnings = append(warnings,
+				"scheduling fields (suspend/timeZone/concurrencyPolicy/...) are ignored when spec.schedule is empty")
+		}
+	}
+	if job.Spec.TimeZone != nil && *job.Spec.TimeZone != "" {
+		if _, err := time.LoadLocation(*job.Spec.TimeZone); err != nil {
+			errs = append(errs, field.Invalid(specPath.Child("timeZone"), *job.Spec.TimeZone,
+				fmt.Sprintf("invalid IANA time zone: %v", err)))
 		}
 	}
 

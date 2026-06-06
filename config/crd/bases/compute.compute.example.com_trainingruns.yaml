@@ -59,6 +59,18 @@ spec:
                 items:
                   type: string
                 type: array
+              builtinTrainer:
+                description: |-
+                  BuiltinTrainer selects a controller-supplied training script so the user
+                  doesn't have to embed Python in YAML. Mutually exclusive with Script —
+                  if both are set, Script wins.
+                    BERTClassifier — fine-tunes a HuggingFace BERT-family model on Parquet
+                      produced by the orders/articles ELT pipeline. Configurable purely via
+                      env vars: BERT_MODEL, TEXT_COLUMN, LABEL_COLUMN, NUM_LABELS,
+                      DATA_PARQUET_GLOB, MODEL_OUT, EPOCHS, BATCH_SIZE, MAX_LENGTH, LR.
+                enum:
+                - BERTClassifier
+                type: string
               checkpoint:
                 description: |-
                   CheckpointSpec configures where state is persisted so a job can resume after

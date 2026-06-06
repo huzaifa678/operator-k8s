@@ -12,7 +12,7 @@
 #
 # Or apply only a specific resource:
 #
-#   argocd app sync samples --resource '*:SparkJob:sparkpi-sample'
+#   argocd app sync samples --resource '*:SparkJob:elt-orders-pipeline'
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:

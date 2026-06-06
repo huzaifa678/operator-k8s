@@ -1,5 +1,7 @@
-## Append samples of your project ##
 resources:
+# Storage first — both TrainingRun samples mount this PVC.
+- articles_processed_pvc.yaml
+- compute_v1alpha1_sparkjob_scrape.yaml
 - compute_v1alpha1_sparkjob.yaml
 - compute_v1alpha1_trainingrun.yaml
 - compute_v1alpha1_trainingrun_gpu.yaml

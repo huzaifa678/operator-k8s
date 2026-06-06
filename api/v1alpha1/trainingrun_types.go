@@ -74,6 +74,17 @@ type TrainingRunSpec struct {
 	// +optional
 	Script string `json:"script,omitempty"`
 
+	// BuiltinTrainer selects a controller-supplied training script so the user
+	// doesn't have to embed Python in YAML. Mutually exclusive with Script —
+	// if both are set, Script wins.
+	//   BERTClassifier — fine-tunes a HuggingFace BERT-family model on Parquet
+	//     produced by the orders/articles ELT pipeline. Configurable purely via
+	//     env vars: BERT_MODEL, TEXT_COLUMN, LABEL_COLUMN, NUM_LABELS,
+	//     DATA_PARQUET_GLOB, MODEL_OUT, EPOCHS, BATCH_SIZE, MAX_LENGTH, LR.
+	// +optional
+	// +kubebuilder:validation:Enum=BERTClassifier
+	BuiltinTrainer string `json:"builtinTrainer,omitempty"`
+
 	// pip packages installed at container start (before torchrun launches).
 	// Requires the image to have pip on PATH. Skipped if empty.
 	// For production, bake these into the image instead.

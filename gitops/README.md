@@ -53,7 +53,7 @@ Pushed nothing yet, want to test? Sync from your working tree:
 # Push the local Kustomize output directly to ArgoCD without committing
 argocd app sync compute-operator --local ./config/default
 
-# Same for samples — re-run the SparkPi / TrainingRun without a git push
+# Same for the 3-stage orders pipeline (scrape → ELT → BERT fine-tune)
 argocd app sync samples --local ./config/samples --force --replace --prune
 ```
 
@@ -74,8 +74,7 @@ it means the `repoURL` in `applications/samples.yaml` points at a repo Argo can'
 > kubectl -n argocd port-forward svc/argocd-server 8080:443
 >
 > # Terminal 2
-> ARGO_PW=$(kubectl -n argocd get secret argocd-initial-admin-secret \
->   -o jsonpath='{.data.password}' | base64 -d)
+> ARGO_PW=$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath='{.data.password}' | base64 -d)
 > argocd login localhost:8080 --username admin --password "$ARGO_PW" --insecure
 >
 > argocd app sync samples --local ./config/samples --force --replace --prune
@@ -123,14 +122,16 @@ argocd app set compute-operator --kustomize-image controller=ghcr.io/me/compute-
 argocd app sync compute-operator
 ```
 
-### "I want to (re)run the SparkPi sample"
+### "I want to (re)run a stage of the pipeline"
 
 ```bash
-# Either via Makefile:
+# Sync everything (all 3 pipeline stages + GPU variant) via Makefile:
 make gitops-sync-samples
 
-# Or targeting a single resource:
-argocd app sync samples --resource '*:SparkJob:sparkpi-sample'
+# Or target a single stage — these correspond to files under config/samples/:
+argocd app sync samples --resource '*:SparkJob:scrape-orders-raw'      # stage 1: scrape
+argocd app sync samples --resource '*:SparkJob:elt-orders-pipeline'    # stage 2: ELT
+argocd app sync samples --resource '*:TrainingRun:bert-finetune-orders' # stage 3: train
 ```
 
 ### "ArgoCD is showing OutOfSync and I just want to nuke + redeploy"

@@ -84,6 +84,19 @@ func validateTrainingRun(run *computev1alpha1.TrainingRun) (admission.Warnings, 
 				"command (which runs /scripts/train.py) is bypassed — make sure your custom "+
 				"command invokes the mounted script if you still want it to run.")
 	}
+	if run.Spec.Script != "" && run.Spec.BuiltinTrainer != "" {
+		warnings = append(warnings,
+			"spec.script and spec.builtinTrainer are both set — spec.script wins; "+
+				"the builtin is ignored. Drop one of them.")
+	}
+	if run.Spec.BuiltinTrainer != "" {
+		switch run.Spec.BuiltinTrainer {
+		case "BERTClassifier":
+		default:
+			errs = append(errs, field.NotSupported(specPath.Child("builtinTrainer"),
+				run.Spec.BuiltinTrainer, []string{"BERTClassifier"}))
+		}
+	}
 	if len(run.Spec.Packages) > 0 && len(run.Spec.Command) > 0 {
 		warnings = append(warnings,
 			"spec.packages relies on the default sh -c command to run `pip install` before "+

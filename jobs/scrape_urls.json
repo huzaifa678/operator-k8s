@@ -1,0 +1,6 @@
+[
+  {"url": "https://hnrss.org/frontpage",                                                  "format": "xml", "source": "hn_frontpage"},
+  {"url": "https://hnrss.org/best",                                                       "format": "xml", "source": "hn_best"},
+  {"url": "https://www.reddit.com/r/programming.rss",                                     "format": "xml", "source": "reddit_programming"},
+  {"url": "https://raw.githubusercontent.com/owid/co2-data/master/owid-co2-data.csv",     "format": "csv", "source": "owid_co2"}
+]

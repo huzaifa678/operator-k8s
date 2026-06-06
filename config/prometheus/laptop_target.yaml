@@ -1,0 +1,78 @@
+# Scrape the controller when it's running on your laptop via `make run`,
+# without deploying it in-cluster. The flow:
+#
+#   make run  →  laptop:8080/metrics (plain HTTP)
+#                      ↑
+#       docker bridge gateway 172.21.0.1
+#                      ↑
+#   Prometheus pod in monitoring ns → this Service → EndpointSlice (172.21.0.1:8080)
+#
+# Requirements / one-time setup:
+#   1. `make run` must expose /metrics. The Makefile target now passes
+#      --metrics-bind-address=:8080  (see Makefile change).
+#   2. The IP below is the docker bridge gateway for the k3d-compute-op network.
+#      Verify with: `docker network inspect k3d-compute-op | jq '.[0].IPAM.Config'`.
+#      If your gateway is different, change 172.21.0.1 below.
+#
+# Why this design (selectorless Service + manual EndpointSlice):
+#   ServiceMonitor needs a Service to select. The controller isn't a Pod in
+#   k3s, so we synthesize a Service whose endpoints point at an external IP.
+#   Prometheus-operator handles selectorless Services + EndpointSlice fine.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: laptop-controller-metrics
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: k8s-operator
+    target: laptop-make-run
+spec:
+  ports:
+    - name: http-metrics
+      port: 8080
+      protocol: TCP
+      targetPort: 8080
+  # selector intentionally omitted — endpoints are managed manually below.
+---
+apiVersion: discovery.k8s.io/v1
+kind: EndpointSlice
+metadata:
+  name: laptop-controller-metrics
+  namespace: monitoring
+  labels:
+    # MUST match the Service name so the prom-operator stitches them together.
+    kubernetes.io/service-name: laptop-controller-metrics
+addressType: IPv4
+ports:
+  - name: http-metrics
+    port: 8080
+    protocol: TCP
+endpoints:
+  - addresses:
+      - "172.21.0.1"       
+    conditions:
+      ready: true
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: laptop-controller-metrics
+  namespace: monitoring
+  labels:
+    # kube-prometheus-stack scrapes ServiceMonitors in any namespace because
+    # the helm install sets serviceMonitorSelectorNilUsesHelmValues=false
+    # (see Makefile install-prometheus target). No extra labels needed.
+    app.kubernetes.io/name: k8s-operator
+spec:
+  selector:
+    matchLabels:
+      target: laptop-make-run
+  namespaceSelector:
+    matchNames: [monitoring]
+  endpoints:
+    - port: http-metrics
+      path: /metrics
+      scheme: http       # `make run` exposes plain HTTP — no TLS, no bearer.
+      interval: 30s
+      scrapeTimeout: 10s

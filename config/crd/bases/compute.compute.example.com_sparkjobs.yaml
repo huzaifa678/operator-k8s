@@ -15,6 +15,9 @@ spec:
   scope: Namespaced
   versions:
   - additionalPrinterColumns:
+    - jsonPath: .spec.schedule
+      name: Schedule
+      type: string
     - jsonPath: .status.phase
       name: Phase
       type: string
@@ -24,6 +27,9 @@ spec:
     - jsonPath: .status.estimatedCostUSD
       name: Cost
       type: string
+    - jsonPath: .status.nextScheduleTime
+      name: NextRun
+      type: date
     - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date
@@ -78,6 +84,19 @@ spec:
                       works.
                     type: string
                 type: object
+              concurrencyPolicy:
+                default: Forbid
+                description: |-
+                  ConcurrencyPolicy controls how to treat in-flight children when a new
+                  fire time arrives. Defaults to Forbid.
+                    Allow   – run a new child even if previous is still running
+                    Forbid  – skip this tick if any active child exists
+                    Replace – delete active children, then run a new one
+                enum:
+                - Allow
+                - Forbid
+                - Replace
+                type: string
               driverResources:
                 description: Driver pod resource requests.
                 properties:
@@ -137,6 +156,217 @@ spec:
                       More info: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/
                     type: object
                 type: object
+              env:
+                description: |-
+                  Env adds environment variables to the spark-submit driver container.
+                  In --deploy-mode client (what this operator runs), the driver container
+                  IS spark-submit, so these are visible to any Hadoop / AWS SDK credential
+                  chain evaluated during prepareSubmitEnvironment.
+                items:
+                  description: EnvVar represents an environment variable present in
+                    a Container.
+                  properties:
+                    name:
+                      description: |-
+                        Name of the environment variable.
+                        May consist of any printable ASCII characters except '='.
+                      type: string
+                    value:
+                      description: |-
+                        Variable references $(VAR_NAME) are expanded
+                        using the previously defined environment variables in the container and
+                        any service environment variables. If a variable cannot be resolved,
+                        the reference in the input string will be unchanged. Double $$ are reduced
+                        to a single $, which allows for escaping the $(VAR_NAME) syntax: i.e.
+                        "$$(VAR_NAME)" will produce the string literal "$(VAR_NAME)".
+                        Escaped references will never be expanded, regardless of whether the variable
+                        exists or not.
+                        Defaults to "".
+                      type: string
+                    valueFrom:
+                      description: Source for the environment variable's value. Cannot
+                        be used if value is not empty.
+                      properties:
+                        configMapKeyRef:
+                          description: Selects a key of a ConfigMap.
+                          properties:
+                            key:
+                              description: The key to select.
+                              type: string
+                            name:
+                              default: ""
+                              description: |-
+                                Name of the referent.
+                                This field is effectively required, but due to backwards compatibility is
+                                allowed to be empty. Instances of this type with an empty value here are
+                                almost certainly wrong.
+                                More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                              type: string
+                            optional:
+                              description: Specify whether the ConfigMap or its key
+                                must be defined
+                              type: boolean
+                          required:
+                          - key
+                          type: object
+                          x-kubernetes-map-type: atomic
+                        fieldRef:
+                          description: |-
+                            Selects a field of the pod: supports metadata.name, metadata.namespace, `metadata.labels['<KEY>']`, `metadata.annotations['<KEY>']`,
+                            spec.nodeName, spec.serviceAccountName, status.hostIP, status.podIP, status.podIPs.
+                          properties:
+                            apiVersion:
+                              description: Version of the schema the FieldPath is
+                                written in terms of, defaults to "v1".
+                              type: string
+                            fieldPath:
+                              description: Path of the field to select in the specified
+                                API version.
+                              type: string
+                          required:
+                          - fieldPath
+                          type: object
+                          x-kubernetes-map-type: atomic
+                        fileKeyRef:
+                          description: |-
+                            FileKeyRef selects a key of the env file.
+                            Requires the EnvFiles feature gate to be enabled.
+                          properties:
+                            key:
+                              description: |-
+                                The key within the env file. An invalid key will prevent the pod from starting.
+                                The keys defined within a source may consist of any printable ASCII characters except '='.
+                                During Alpha stage of the EnvFiles feature gate, the key size is limited to 128 characters.
+                              type: string
+                            optional:
+                              default: false
+                              description: |-
+                                Specify whether the file or its key must be defined. If the file or key
+                                does not exist, then the env var is not published.
+                                If optional is set to true and the specified key does not exist,
+                                the environment variable will not be set in the Pod's containers.
+
+                                If optional is set to false and the specified key does not exist,
+                                an error will be returned during Pod creation.
+                              type: boolean
+                            path:
+                              description: |-
+                                The path within the volume from which to select the file.
+                                Must be relative and may not contain the '..' path or start with '..'.
+                              type: string
+                            volumeName:
+                              description: The name of the volume mount containing
+                                the env file.
+                              type: string
+                          required:
+                          - key
+                          - path
+                          - volumeName
+                          type: object
+                          x-kubernetes-map-type: atomic
+                        resourceFieldRef:
+                          description: |-
+                            Selects a resource of the container: only resources limits and requests
+                            (limits.cpu, limits.memory, limits.ephemeral-storage, requests.cpu, requests.memory and requests.ephemeral-storage) are currently supported.
+                          properties:
+                            containerName:
+                              description: 'Container name: required for volumes,
+                                optional for env vars'
+                              type: string
+                            divisor:
+                              anyOf:
+                              - type: integer
+                              - type: string
+                              description: Specifies the output format of the exposed
+                                resources, defaults to "1"
+                              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                              x-kubernetes-int-or-string: true
+                            resource:
+                              description: 'Required: resource to select'
+                              type: string
+                          required:
+                          - resource
+                          type: object
+                          x-kubernetes-map-type: atomic
+                        secretKeyRef:
+                          description: Selects a key of a secret in the pod's namespace
+                          properties:
+                            key:
+                              description: The key of the secret to select from.  Must
+                                be a valid secret key.
+                              type: string
+                            name:
+                              default: ""
+                              description: |-
+                                Name of the referent.
+                                This field is effectively required, but due to backwards compatibility is
+                                allowed to be empty. Instances of this type with an empty value here are
+                                almost certainly wrong.
+                                More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                              type: string
+                            optional:
+                              description: Specify whether the Secret or its key must
+                                be defined
+                              type: boolean
+                          required:
+                          - key
+                          type: object
+                          x-kubernetes-map-type: atomic
+                      type: object
+                  required:
+                  - name
+                  type: object
+                type: array
+              envFrom:
+                description: |-
+                  EnvFrom adds bulk environment sources (Secret / ConfigMap) to the driver
+                  container. Use this to project AWS credentials without baking them into
+                  sparkConf: see config/samples for the aws-creds Secret pattern.
+                items:
+                  description: EnvFromSource represents the source of a set of ConfigMaps
+                    or Secrets
+                  properties:
+                    configMapRef:
+                      description: The ConfigMap to select from
+                      properties:
+                        name:
+                          default: ""
+                          description: |-
+                            Name of the referent.
+                            This field is effectively required, but due to backwards compatibility is
+                            allowed to be empty. Instances of this type with an empty value here are
+                            almost certainly wrong.
+                            More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                          type: string
+                        optional:
+                          description: Specify whether the ConfigMap must be defined
+                          type: boolean
+                      type: object
+                      x-kubernetes-map-type: atomic
+                    prefix:
+                      description: |-
+                        Optional text to prepend to the name of each environment variable.
+                        May consist of any printable ASCII characters except '='.
+                      type: string
+                    secretRef:
+                      description: The Secret to select from
+                      properties:
+                        name:
+                          default: ""
+                          description: |-
+                            Name of the referent.
+                            This field is effectively required, but due to backwards compatibility is
+                            allowed to be empty. Instances of this type with an empty value here are
+                            almost certainly wrong.
+                            More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                          type: string
+                        optional:
+                          description: Specify whether the Secret must be defined
+                          type: boolean
+                      type: object
+                      x-kubernetes-map-type: atomic
+                  type: object
+                type: array
               executorResources:
                 description: Executor pod resource requests.
                 properties:
@@ -203,6 +433,12 @@ spec:
                   controller auto-tunes based on input size.
                 format: int32
                 type: integer
+              failedJobsHistoryLimit:
+                default: 3
+                description: FailedJobsHistoryLimit keeps this many Failed children
+                  for audit. Defaults to 3.
+                format: int32
+                type: integer
               image:
                 default: apache/spark:3.5.3
                 description: |-
@@ -242,6 +478,13 @@ spec:
                     format: int64
                     type: integer
                 type: object
+              schedule:
+                description: |-
+                  Schedule is a cron expression (5-field, "min hour dom mon dow"). When set,
+                  the SparkJob behaves as a *template*: the controller never spawns a driver
+                  pod for it directly, instead creating a child SparkJob (with Schedule=nil)
+                  on every fire time. Leave unset for one-shot jobs.
+                type: string
               serviceAccount:
                 description: |-
                   ServiceAccount the driver runs as. If empty, the controller creates
@@ -275,6 +518,30 @@ spec:
                     - Preferred
                     type: string
                 type: object
+              startingDeadlineSeconds:
+                description: |-
+                  StartingDeadlineSeconds is the deadline (in seconds since a missed fire
+                  time) past which a missed run will be skipped rather than back-filled.
+                  Mirrors batch/v1 CronJob.spec.startingDeadlineSeconds.
+                format: int64
+                type: integer
+              successfulJobsHistoryLimit:
+                default: 3
+                description: |-
+                  SuccessfulJobsHistoryLimit keeps this many Succeeded children for audit;
+                  older Succeeded children are garbage-collected. Defaults to 3.
+                format: int32
+                type: integer
+              suspend:
+                description: |-
+                  Suspend pauses scheduling without deleting the template. Existing children
+                  continue to run; no new children are created while true.
+                type: boolean
+              timeZone:
+                description: |-
+                  IANA time zone (e.g. "Etc/UTC", "America/New_York") used to evaluate the
+                  cron expression. Defaults to UTC.
+                type: string
               type:
                 default: Scala
                 description: Application type. Affects how the driver command is constructed.
@@ -289,6 +556,55 @@ spec:
           status:
             description: SparkJobStatus reflects observed state.
             properties:
+              active:
+                description: |-
+                  Active is the list of currently running child SparkJob runs
+                  (scheduled-mode only).
+                items:
+                  description: ObjectReference contains enough information to let
+                    you inspect or modify the referred object.
+                  properties:
+                    apiVersion:
+                      description: API version of the referent.
+                      type: string
+                    fieldPath:
+                      description: |-
+                        If referring to a piece of an object instead of an entire object, this string
+                        should contain a valid JSON/Go field access statement, such as desiredState.manifest.containers[2].
+                        For example, if the object reference is to a container within a pod, this would take on a value like:
+                        "spec.containers{name}" (where "name" refers to the name of the container that triggered
+                        the event) or if no container name is specified "spec.containers[2]" (container with
+                        index 2 in this pod). This syntax is chosen only to have some well-defined way of
+                        referencing a part of an object.
+                      type: string
+                    kind:
+                      description: |-
+                        Kind of the referent.
+                        More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds
+                      type: string
+                    name:
+                      description: |-
+                        Name of the referent.
+                        More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                      type: string
+                    namespace:
+                      description: |-
+                        Namespace of the referent.
+                        More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/namespaces/
+                      type: string
+                    resourceVersion:
+                      description: |-
+                        Specific resourceVersion to which this reference is made, if any.
+                        More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#concurrency-control-and-consistency
+                      type: string
+                    uid:
+                      description: |-
+                        UID of the referent.
+                        More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#uids
+                      type: string
+                  type: object
+                  x-kubernetes-map-type: atomic
+                type: array
               completionTime:
                 description: When the job completed (Succeeded or Failed).
                 format: date-time
@@ -362,6 +678,17 @@ spec:
               estimatedCostUSD:
                 description: Estimated cost in USD accrued so far (driver + executors
                   * uptime).
+                type: string
+              lastScheduleTime:
+                description: |-
+                  LastScheduleTime is when the most recent child run was started
+                  (scheduled-mode only).
+                format: date-time
+                type: string
+              nextScheduleTime:
+                description: NextScheduleTime is the next planned fire time (scheduled-mode
+                  only).
+                format: date-time
                 type: string
               phase:
                 description: Phase is a coarse high-level status shared by both CRDs.

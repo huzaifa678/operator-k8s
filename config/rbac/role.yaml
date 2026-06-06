@@ -27,6 +27,14 @@ rules:
   - create
   - patch
 - apiGroups:
+  - ""
+  resources:
+  - secrets
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
   - compute.compute.example.com
   resources:
   - sparkjobs

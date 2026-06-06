@@ -137,16 +137,32 @@ func (r *TrainingRunReconciler) listWorkers(ctx context.Context, run *computev1a
 	return pods.Items, nil
 }
 
-// ensureScriptConfigMap creates (or updates) a ConfigMap holding the inline
-// training script. No-op when spec.script is empty.
+// effectiveScript returns the Python the controller should mount at
+// /scripts/train.py. Precedence: Spec.Script (explicit user code) wins over
+// Spec.BuiltinTrainer (controller-supplied). Returns "" when neither is set.
+func effectiveScript(run *computev1alpha1.TrainingRun) string {
+	if run.Spec.Script != "" {
+		return run.Spec.Script
+	}
+	switch run.Spec.BuiltinTrainer {
+	case "BERTClassifier":
+		return bertClassifierScript
+	}
+	return ""
+}
+
+// ensureScriptConfigMap creates (or updates) a ConfigMap holding the
+// effective training script (user-supplied OR controller built-in). No-op
+// when neither is set.
 func (r *TrainingRunReconciler) ensureScriptConfigMap(ctx context.Context, run *computev1alpha1.TrainingRun) error {
-	if run.Spec.Script == "" {
+	script := effectiveScript(run)
+	if script == "" {
 		return nil
 	}
 	name := run.Name + "-script"
 	desired := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: run.Namespace},
-		Data:       map[string]string{trainingScriptKey: run.Spec.Script},
+		Data:       map[string]string{trainingScriptKey: script},
 	}
 	if err := controllerutil.SetControllerReference(run, desired, r.Scheme); err != nil {
 		return err
@@ -160,7 +176,7 @@ func (r *TrainingRunReconciler) ensureScriptConfigMap(ctx context.Context, run *
 	if err != nil {
 		return err
 	}
-	if existing.Data[trainingScriptKey] == run.Spec.Script {
+	if existing.Data[trainingScriptKey] == script {
 		return nil
 	}
 	existing.Data = desired.Data
@@ -290,11 +306,12 @@ func buildWorkerPod(run *computev1alpha1.TrainingRun, rank int32) *corev1.Pod {
 		procPerNode = run.Spec.GPU.PerWorker
 	}
 
+	script := effectiveScript(run)
 	cmd := run.Spec.Command
 	args := run.Spec.Args
 	if len(cmd) == 0 {
 		switch {
-		case run.Spec.Script != "":
+		case script != "":
 			// Self-contained mode: pip-install Packages (if any) then torchrun
 			// the mounted /scripts/train.py. Env vars are interpolated by sh.
 			pipInstall := ""
@@ -377,7 +394,7 @@ func buildWorkerPod(run *computev1alpha1.TrainingRun, rank int32) *corev1.Pod {
 			corev1.VolumeMount{Name: "dataset", MountPath: "/data", ReadOnly: true})
 	}
 
-	if run.Spec.Script != "" {
+	if script != "" {
 		pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
 			Name: "script",
 			VolumeSource: corev1.VolumeSource{

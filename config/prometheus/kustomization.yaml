@@ -1,5 +1,8 @@
 resources:
 - monitor.yaml
+# Targets the controller while it runs on your laptop via `make run`.
+# Drops in the same kustomize bundle so `make enable-metrics-monitoring` applies it.
+- laptop_target.yaml
 
 # [PROMETHEUS-WITH-CERTS] The following patch configures the ServiceMonitor in ../prometheus
 # to securely reference certificates created and managed by cert-manager.

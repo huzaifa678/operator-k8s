@@ -1,0 +1,23 @@
+# PVC the ELT job writes its processed Parquet to, and the TrainingRun mounts
+# read-only at /data for the built-in BERT trainer.
+#
+# Storage class: omitted on purpose so this is portable — k3d's `local-path`
+# default provisioner works; on EKS/GKE the cluster's default StorageClass is
+# whatever you set up (gp3 / pd-standard / EFS via a CSI driver, etc.).
+#
+# Sizing: 10Gi is plenty for the article-corpus demo. Bump for production:
+# Parquet for 50k orders ≈ 5MB; for a multi-million-row dataset, 100Gi+.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: articles-processed-pvc
+  namespace: default
+  labels:
+    pipeline: articles
+    stage: storage
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi

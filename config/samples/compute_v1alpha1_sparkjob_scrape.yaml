@@ -1,0 +1,67 @@
+apiVersion: compute.compute.example.com/v1alpha1
+kind: SparkJob
+metadata:
+  name: scrape-articles-raw
+  labels:
+    pipeline: articles
+    stage: scrape
+spec:
+  type: Python
+  # Custom image with hadoop-aws + aws-java-sdk-bundle baked in.
+  # Build + import with: `make spark-image`. See cluster/spark/Dockerfile.
+  image: compute-operator/spark-s3:3.5.3
+  mainApplicationFile: s3a://spark-lake-2998043/jobs/scrape_articles.py
+
+  # Scraping is I/O-bound; more small executors > fewer big ones.
+  minExecutors: 3
+  maxExecutors: 8
+  resourceHint:
+    inputSizeMB: 50        # URL list itself is tiny; hint drives executor floor
+    costPerHourUSD: "0.08"
+
+  driverResources:
+    requests:
+      cpu: "250m"
+      memory: "512Mi"
+
+  executorResources:
+    requests:
+      cpu: "500m"
+      memory: "1Gi"
+
+  # No --date: scrape_articles.py defaults to today (UTC).
+  # The daily CronJob in config/samples/cron/ overrides --date when back-filling.
+  arguments:
+    - "--url-manifest"
+    - "s3a://spark-lake-2998043/config/scrape_urls.json"
+    - "--dest-base"
+    - "s3a://spark-lake-2998043/raw/articles/"
+
+  # AWS credentials injected from a Secret you create out-of-band:
+  #   kubectl create secret generic aws-creds \
+  #     --from-literal=AWS_ACCESS_KEY_ID=AKIA... \
+  #     --from-literal=AWS_SECRET_ACCESS_KEY=...
+  # (For EKS, drop this envFrom and put IRSA back via ServiceAccount annotations.)
+  envFrom:
+    - secretRef:
+        name: aws-creds
+
+  sparkConf:
+    # hadoop-aws + aws-java-sdk-bundle are baked into compute-operator/spark-s3
+    # (see cluster/spark/Dockerfile); no spark.jars.packages needed.
+    spark.hadoop.fs.s3a.impl: org.apache.hadoop.fs.s3a.S3AFileSystem
+    # EnvironmentVariableCredentialsProvider reads AWS_ACCESS_KEY_ID /
+    # AWS_SECRET_ACCESS_KEY — supplied by envFrom: aws-creds above. The
+    # controller auto-propagates that Secret to Spark-created executor pods,
+    # so no spark.kubernetes.executor.secretKeyRef.* lines are needed here.
+    # Replace with WebIdentityTokenCredentialsProvider on EKS with IRSA.
+    spark.hadoop.fs.s3a.aws.credentials.provider: com.amazonaws.auth.EnvironmentVariableCredentialsProvider
+    spark.kubernetes.driver.label.pipeline: articles
+    spark.kubernetes.executor.label.pipeline: articles
+
+  spot:
+    enabled: true
+    maxRetries: 3
+
+  checkpoint:
+    enabled: false

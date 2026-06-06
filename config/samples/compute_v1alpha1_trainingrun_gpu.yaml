@@ -1,147 +1,46 @@
-# GPU variant of the BERT-tiny TrainingRun.
+# GPU variant of the articles BERT fine-tune.
 # Requires:
 #   1. A real cluster with NVIDIA GPU nodes (k3d has none).
 #   2. The NVIDIA GPU Operator installed:    make install-gpu-operator
-#      (this brings up the device plugin, drivers, runtime class, node labels)
-# The controller turns spec.gpu into:
-#   - resources.requests/limits: nvidia.com/gpu: <perWorker>
-#   - nodeSelector: nvidia.com/gpu.present=true   (labelled by the GPU Operator)
-#   - runtimeClassName: nvidia                    (registered by the GPU Operator)
-#   - toleration for the nvidia.com/gpu:NoSchedule taint
-#   - torchrun --nproc_per_node=<perWorker>
-#   - TORCH_DISTRIBUTED_DEFAULT_BACKEND=nccl  (instead of gloo)
+#   3. The articles-processed-pvc PVC populated by elt-orders-pipeline.
 apiVersion: compute.compute.example.com/v1alpha1
 kind: TrainingRun
 metadata:
-  name: bert-tiny-ddp-gpu 
+  name: bert-finetune-articles-gpu
+  labels:
+    pipeline: articles
+    stage: train
 spec:
   framework: PyTorch
   image: pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
-  worldSize: 2                # 2 worker pods
+  worldSize: 2
   gpu:
     enabled: true
-    perWorker: 1              # 1 GPU per pod -> 2 GPUs total, nproc_per_node=1
+    perWorker: 1
     runtimeClass: nvidia
     backend: nccl
-    # nodeSelector defaults to {"nvidia.com/gpu.present":"true"} if omitted.
-    # Override here for non-GPU-Operator clusters, e.g.:
-    # nodeSelector:
-    #   accelerator: a100
   workerResources:
-    requests:
-      cpu: "2"
-      memory: "8Gi"
-    limits:
-      memory: "16Gi"
+    requests: { cpu: "2", memory: "8Gi" }
+    limits:   { memory: "16Gi" }
   packages:
     - transformers==4.44.2
+    - pandas==2.2.2
+    - pyarrow==17.0.0
+  datasetPVC: articles-processed-pvc
   resourceHint:
-    costPerHourUSD: "2.50"    # rough A10G / T4 on-demand rate
+    costPerHourUSD: "2.50"
   spot:
-    enabled: true             # GPU spot instances are where the savings live
+    enabled: true
     mode: Preferred
     maxRetries: 3
+  # Same controller built-in as the CPU variant. The script auto-detects CUDA
+  # and switches to ModernBERT-base + nccl + larger batch size when GPUs are
+  # visible — no script-level changes needed.
+  builtinTrainer: BERTClassifier
   env:
-    - { name: PYTHONUNBUFFERED, value: "1" }
+    - { name: PYTHONUNBUFFERED,       value: "1" }
     - { name: TRANSFORMERS_VERBOSITY, value: "error" }
-    - { name: NCCL_DEBUG, value: "WARN" }
-  script: |
-    """Same toy bert-tiny fine-tune as the CPU variant, but uses CUDA + NCCL.
-
-    ─── TWEAK POINTS ─────────────────────────────────────────────────────────
-    Same as the CPU sample — adapt MODEL, NUM_LABELS, ToyDataset, optimizer,
-    and the model head class to fit your task. GPU-specific extras:
-
-      torch.cuda.set_device(local_rank)   pinned by LOCAL_RANK which torchrun
-                                          injects per process; if you bump
-                                          gpu.perWorker above 1 in the CR,
-                                          torchrun spawns N processes per pod
-                                          and each gets a distinct LOCAL_RANK.
-
-      model.to(device) + DDP(device_ids)  required so NCCL knows which GPU to
-                                          register the model on.
-
-      Mixed precision                     wrap forward+backward in
-                                          torch.autocast("cuda", dtype=torch.bfloat16)
-                                          on A10G/A100/H100 to roughly halve
-                                          memory + speed up training.
-
-      Gradient accumulation               raise BATCH_SIZE in the loop instead
-                                          of in DataLoader to fit larger
-                                          effective batches without OOM.
-    ──────────────────────────────────────────────────────────────────────────
-    """
-    import os
-    import torch
-    import torch.distributed as dist
-    from torch.nn.parallel import DistributedDataParallel as DDP
-    from torch.optim import AdamW
-    from torch.utils.data import DataLoader, Dataset, DistributedSampler
-    from transformers import AutoModelForSequenceClassification, AutoTokenizer
-
-    # ─── tweak: model + task config ───────────────────────────────────────
-    MODEL         = "prajjwal1/bert-tiny"
-    NUM_LABELS    = 2
-    MAX_LENGTH    = 32
-    BATCH_SIZE    = 2
-    EPOCHS        = 3
-    LEARNING_RATE = 5e-5
-
-    # ─── tweak: replace with your own Dataset (read /data or stream from S3) ──
-    class ToyDataset(Dataset):
-        SAMPLES = [
-            ("the movie was wonderful and uplifting", 1),
-            ("absolutely loved the cinematography",   1),
-            ("a complete waste of two hours",         0),
-            ("boring and predictable from start",     0),
-        ]
-        def __init__(self, tok):
-            self.enc = [tok(s, padding="max_length", truncation=True,
-                            max_length=MAX_LENGTH, return_tensors="pt")
-                        for s, _ in self.SAMPLES]
-            self.lab = torch.tensor([l for _, l in self.SAMPLES])
-        def __len__(self):  return len(self.SAMPLES)
-        def __getitem__(self, i):
-            e = self.enc[i]
-            return e["input_ids"].squeeze(0), e["attention_mask"].squeeze(0), self.lab[i]
-
-    def main():
-        rank        = int(os.environ["RANK"])
-        world_size  = int(os.environ["WORLD_SIZE"])
-        local_rank  = int(os.environ.get("LOCAL_RANK", "0"))
-        backend     = os.environ.get("TORCH_DISTRIBUTED_DEFAULT_BACKEND", "nccl")
-
-        torch.cuda.set_device(local_rank)
-        device = torch.device(f"cuda:{local_rank}")
-        dist.init_process_group(backend=backend)
-        print(f"[rank {rank}/{world_size}] CUDA={torch.cuda.is_available()} "
-              f"device={torch.cuda.get_device_name(local_rank)} backend={backend}", flush=True)
-
-        tok   = AutoTokenizer.from_pretrained(MODEL)
-        # ─── tweak: pick the model head class that matches your task ─────
-        model = AutoModelForSequenceClassification.from_pretrained(
-            MODEL, num_labels=NUM_LABELS).to(device)
-        model = DDP(model, device_ids=[local_rank])
-
-        ds      = ToyDataset(tok)
-        sampler = DistributedSampler(ds, num_replicas=world_size, rank=rank, shuffle=True)
-        loader  = DataLoader(ds, batch_size=BATCH_SIZE, sampler=sampler)
-        # ─── tweak: swap optimizer (Lion / AdaFactor / bnb-8bit) for bigger models ──
-        optim   = AdamW(model.parameters(), lr=LEARNING_RATE)
-
-        for epoch in range(EPOCHS):
-            sampler.set_epoch(epoch)
-            for ids, mask, lab in loader:
-                ids, mask, lab = ids.to(device), mask.to(device), lab.to(device)
-                optim.zero_grad()
-                out = model(input_ids=ids, attention_mask=mask, labels=lab)
-                out.loss.backward()
-                optim.step()
-                print(f"[rank {rank}] epoch={epoch} loss={out.loss.item():.4f}", flush=True)
-
-        if rank == 0:
-            print("[rank 0] training complete", flush=True)
-        dist.destroy_process_group()
-
-    if __name__ == "__main__":
-        main()
+    - { name: NCCL_DEBUG,             value: "WARN" }
+    - { name: TEXT_COLUMN,        value: "title" }
+    - { name: LABEL_COLUMN,       value: "source" }
+    - { name: DATA_PARQUET_GLOB,  value: "/data/published_date=*/*.parquet" }

@@ -1,0 +1,3 @@
+# Maven-downloaded jars are large (hundreds of MB) and reproducible.
+# Fetch with `make spark-jars`.
+jars/

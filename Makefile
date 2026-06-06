@@ -114,7 +114,12 @@ build: manifests generate fmt vet ## Build manager binary.
 
 .PHONY: run
 run: manifests generate fmt vet ## Run a controller from your host (webhooks OFF — no TLS certs locally).
-	ENABLE_WEBHOOKS=false go run ./cmd/main.go
+	# --metrics-bind-address=:8080 exposes plain-HTTP /metrics so the
+	# laptop_target.yaml ServiceMonitor (config/prometheus/) can scrape it
+	# via the k3d docker bridge. Default is "0" (disabled).
+	ENABLE_WEBHOOKS=false go run ./cmd/main.go \
+		--metrics-bind-address=:8080 \
+		--metrics-secure=false
 
 .PHONY: gen-webhook-certs
 gen-webhook-certs: ## Generate a self-signed cert at $TMPDIR/k8s-webhook-server/serving-certs/ for local webhook dev.
@@ -122,7 +127,11 @@ gen-webhook-certs: ## Generate a self-signed cert at $TMPDIR/k8s-webhook-server/
 
 .PHONY: run-with-webhooks
 run-with-webhooks: manifests generate fmt vet gen-webhook-certs ## Run with webhooks ON. Auto-generates self-signed certs first.
-	go run ./cmd/main.go
+	# Same metrics flags as `make run` so Prometheus' laptop_target.yaml works
+	# in both modes. /metrics on plain HTTP :8080; webhooks separately use TLS.
+	go run ./cmd/main.go \
+		--metrics-bind-address=:8080 \
+		--metrics-secure=false
 
 # If you wish to build the manager image targeting other platforms you can use the --platform flag.
 # (i.e. docker build --platform linux/arm64). However, you must enable docker buildKit for it.
@@ -130,6 +139,40 @@ run-with-webhooks: manifests generate fmt vet gen-webhook-certs ## Run with webh
 .PHONY: docker-build
 docker-build: ## Build docker image with the manager.
 	$(CONTAINER_TOOL) build -t ${IMG} .
+
+SPARK_IMG    ?= compute-operator/spark-s3:3.5.3
+K3D_CLUSTER  ?= compute-op
+HADOOP_AWS_V ?= 3.3.4
+AWS_SDK_V    ?= 1.12.262
+SPARK_JARS_DIR := cluster/spark/jars
+
+.PHONY: spark-jars
+spark-jars: ## Download hadoop-aws + AWS SDK jars into cluster/spark/jars/ (resumable; cached).
+	@mkdir -p $(SPARK_JARS_DIR)
+	@for spec in \
+	  "hadoop-aws-$(HADOOP_AWS_V).jar=https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/$(HADOOP_AWS_V)/hadoop-aws-$(HADOOP_AWS_V).jar" \
+	  "aws-java-sdk-bundle-$(AWS_SDK_V).jar=https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/$(AWS_SDK_V)/aws-java-sdk-bundle-$(AWS_SDK_V).jar" \
+	; do \
+	  name="$${spec%%=*}"; url="$${spec#*=}"; out="$(SPARK_JARS_DIR)/$$name"; \
+	  if [ -s "$$out" ]; then echo "[spark-jars] cached  $$name"; continue; fi; \
+	  echo "[spark-jars] fetching $$name"; \
+	  curl -fL --retry 5 --retry-delay 2 -C - -o "$$out.part" "$$url" && mv "$$out.part" "$$out"; \
+	done
+
+.PHONY: spark-image
+spark-image: spark-jars ## Build the S3A-enabled Spark image (apache/spark:3.5.3 + hadoop-aws + AWS SDK).
+	$(CONTAINER_TOOL) build -t $(SPARK_IMG) cluster/spark
+
+.PHONY: spark-image-k3d
+spark-image-k3d: spark-image ## Build the Spark image and import it into the local k3d cluster.
+	k3d image import $(SPARK_IMG) -c $(K3D_CLUSTER)
+
+S3_BUCKET ?=
+
+.PHONY: upload-jobs
+upload-jobs: ## Upload jobs/*.py + scrape_urls.json to s3://$(S3_BUCKET)/{jobs,config}/.
+	@if [ -z "$(S3_BUCKET)" ]; then echo "ERROR: set S3_BUCKET=<name>"; exit 2; fi
+	BUCKET=$(S3_BUCKET) ./scripts/upload-jobs.sh
 
 .PHONY: docker-push
 docker-push: ## Push docker image with the manager.
